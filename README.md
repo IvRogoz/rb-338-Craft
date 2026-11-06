@@ -1,10 +1,29 @@
 # RB-338 Craft
 
-A local, browser-based music workstation with the ReBirth RB-338 rack: two 303-style bass synthesizers, 808-style and 909-style drum machines, pattern sequencing, and effects.
+A Rust music workstation with the ReBirth RB-338 rack: two 303-style bass synthesizers, 808-style and 909-style drum machines, pattern sequencing, and effects. This repository contains a browser version and a separate native Windows application.
 
-Rust powers the interface, song model, sequencer, and audio engine. WebAssembly runs the engine inside an AudioWorklet, with small JavaScript adapters for browser audio and MIDI APIs. All sound is synthesized at runtime without recorded samples or waveform ROMs.
+The Windows version runs directly as an executable with native rendering, audio, MIDI, and file access. The browser version runs the Rust engine as WebAssembly inside an AudioWorklet, with small JavaScript adapters for browser audio and MIDI APIs. All sound is synthesized at runtime without recorded samples or waveform ROMs.
 
 ![RB-338 Craft showing the current rack, top Song / File launcher, synths, drum machines, mixers, and effects](app-screenshot.png)
+
+*Screenshot of the web version. Native visual matching has not been verified.*
+
+## Windows native version
+
+Download the Windows x64 ZIP from the [v0.1.0 release](https://github.com/IvRogoz/rb-338-Craft/releases/tag/v0.1.0), extract it, and open `RB-338-Craft.exe`. It requires no browser, WebView, WebAssembly, Node.js, or local server. Windows graphics and audio drivers and the Microsoft Visual C++ x64 runtime are required; see the [native requirements](native/README.md#download-and-run).
+
+The native app uses the web rack's design coordinates and native Rust drawing for its controls. It supports JSON and RBS import, JSON saving, a named song library in `%LOCALAPPDATA%\RB338Craft\Songs`, WAV loop export, and native MIDI input. See the [native README](native/README.md) for controls, requirements, and verification limits.
+
+To build from source:
+
+```powershell
+cd native
+.\build.ps1
+```
+
+The output is `native/target/release/rb338-native.exe` relative to the repository root. The native folder is its own Rust workspace; build and test it from that folder.
+
+Native-window appearance, interactive controls, file dialogs, and physical MIDI input remain unverified. The executable has passed its muted audio/file checks and non-window drawing checks; those checks do not establish visual parity with the web version.
 
 ## Features
 
@@ -14,12 +33,12 @@ Rust powers the interface, song model, sequencer, and audio engine. WebAssembly 
 - Song arrangements, loop ranges, measure editing, and automation recording.
 - Section mixers with level, pan, mute, delay sends, and insert routing.
 - Distortion, a pattern-controlled filter (PCF), compression, and tempo-synchronized delay.
-- Browser-local song saves, JSON import/export, and original ReBirth `.rbs` import.
+- Named song saves, JSON import/export, and original ReBirth `.rbs` import.
 - Stereo WAV loop export and MIDI input with optional clock/transport sync.
 
-The rack scales proportionally to fit the browser window. Its panels, knobs, switches, keys, meters, and displays are rendered in HTML/CSS rather than interface images or sprites. **SONG / FILE · LIBRARY** at the top opens a modal for song files, arrangements, MIDI, and supplementary controls.
+Both versions use a proportionally scaled rack and a top **SONG / FILE · LIBRARY** modal for song files, arrangements, MIDI, and supplementary controls. The web interface uses HTML/CSS; the native interface uses Rust drawing.
 
-## Build and run locally
+## Web version: build and run locally
 
 ### Requirements
 
@@ -68,7 +87,7 @@ Press **Space** to toggle playback. The keys `A W S E D F T G Y H U J` enter chr
 
 Delay follows the tempo with straight sixteenths or eighth-note triplets. Stop ends sequencing while retaining echo tails; a second Stop clears the previous tail while repositioning.
 
-### Song / File modal
+### Web Song / File modal
 
 Open the top **SONG / FILE · LIBRARY** button. Close the modal with **CLOSE** or **Escape**.
 
@@ -91,11 +110,21 @@ MIDI requires browser Web MIDI support and device permission. Choose a device or
 
 ## Development and checks
 
-Run the workspace tests:
+Run the web workspace tests from the repository root:
 
 ```sh
 cargo test --workspace
 ```
+
+Run native checks from its independent workspace:
+
+```powershell
+cd native
+cargo test --workspace
+cargo run --release -- --self-test
+```
+
+The native self-test keeps audio output muted and creates no window. It checks audio buffers, transport, recording acknowledgements, JSON round trips, RBS import, WAV export, and drawing-mesh validity. A working Windows audio output device is required even with output muted. Reports are written under `native/target/self-test/` when run from `native/`.
 
 Render 12 seconds of the default song through the native audio engine:
 
@@ -118,6 +147,7 @@ Tests cover import validation, patterns and transport, arrangements and automati
 | [`crates/web/`](crates/web/) | Rust browser interface, WAV export, MIDI decoding, browser adapters, and CSS rack. |
 | [`crates/devserver/`](crates/devserver/) | Native loopback-only static file server. |
 | [`songs/rbs-examples/`](songs/rbs-examples/) | Original ReBirth example songs used by importer tests. |
+| [`native/`](native/) | Independent Windows Rust workspace, native interface and device adapters, copied engine/model, and build instructions. |
 | `dist/` | Generated browser application. |
 | `tools/` | Project-local build tools. |
 
@@ -125,4 +155,4 @@ Tests cover import validation, patterns and transport, arrangements and automati
 
 This is a Rust reimplementation, not the original ReBirth audio engine. Exact ReBirth timbre matching has not been established. The 909 metallic voices are synthesized replacements for the original sample-based sounds. The runtime uses digital oscillators, envelopes, noise, and filters rather than electrical component-network simulation.
 
-Synthesis references, source credits, and retained license notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The original interface artwork described there is retained only as local reference material; the app renders its interface in HTML/CSS.
+Synthesis references, source credits, and retained license notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The original interface artwork described there is retained only as local reference material; the web interface uses HTML/CSS and the native version draws its interface in Rust.
