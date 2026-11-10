@@ -5,8 +5,21 @@ fn unit(v: u8) -> f32 {
     (v.min(127) as f32) / 127.0
 }
 
+pub fn flam_seconds(control: u8, bpm: f32) -> f32 {
+    let ticks = (control.min(127) as f64 * bpm as f64 / 700.).floor() + 2.;
+    (ticks * 60. / (bpm as f64 * 192.)) as f32
+}
+
+pub fn flam_control(knob: f32) -> u8 {
+    (((knob - 0.005) / 0.095) * 127.).round().clamp(0.,127.) as u8
+}
+
 fn rbs_control_value(track: u8, controller: u8, value: u8) -> u8 {
-    if track == 0 && controller == 2 && value != 0 {
+    if (1..=2).contains(&track) && controller == 2 {
+        let index = (value.min(127) >> 2) as i32;
+        let semitones = if index < 13 { (index-13).max(-12) } else { (index-18).clamp(0,12) };
+        ((semitones as f32 / 24. + 0.5) * 127.).round() as u8
+    } else if track == 0 && controller == 2 && value != 0 {
         value.saturating_add(1)
     } else if (track == 5 && controller == 2)
         || (track == 3 && matches!(controller, 11 | 14 | 17 | 19 | 21))
@@ -628,7 +641,7 @@ pub fn import_legacy(text: &str) -> Result<Song, String> {
                         .as_u64()
                         .or_else(|| hit.as_bool().map(u64::from))
                         .ok_or("invalid drum hit")?;
-                    if n > 3 {
+                    if n > 3 + k as u64 {
                         return Err("invalid drum hit".into());
                     }
                     s.patterns[slot].drums[k][j][i] = n as u8
@@ -1079,5 +1092,33 @@ mod regression_mapping_tests {
         let n = raw.len() as u32 - 8;
         raw[4..8].copy_from_slice(&n.to_be_bytes());
         assert!(import(&raw).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fidelity_control_tests {
+    use super::*;
+    #[test]
+    fn flam_intervals_match_reference_and_roundtrip_across_tempos() {
+        for (value, frames) in [(0,256.),(64,1408.),(127,2688.)] {
+            let samples = (flam_seconds(value,120.)*44100./64.).ceil()*64.;
+            assert_eq!(samples,frames);
+        }
+        for bpm in [20.,60.,120.,300.,500.] {
+            for value in 0..=127 {
+                let seconds = flam_seconds(value,bpm);
+                let encoded = flam_control(0.005 + value as f32 / 127. * 0.095);
+                assert_eq!(encoded,value);
+                assert!((flam_seconds(encoded,bpm)-seconds).abs()<1e-6);
+            }
+        }
+    }
+    #[test]
+    fn rbs_tuning_keeps_center_deadband_and_semitone_steps() {
+        for (raw, semitones) in [(0,-12.),(32,-5.),(52,0.),(64,0.),(75,0.),(76,1.),(127,12.)] {
+            let mut song=Song::default();
+            apply_automation(&mut song,&Automation{tick:0,track:1,controller:2,value:rbs_control_value(1,2,raw)});
+            assert_eq!(song.synth[0].tune.round(),semitones);
+        }
     }
 }

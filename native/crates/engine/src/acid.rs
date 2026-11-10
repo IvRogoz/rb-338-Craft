@@ -1,25 +1,12 @@
-//! Sample-free acid voice. The exponential resonance control curve and the
-//! 200 ms accent decay follow Robin Schmidt's MIT-licensed Open303 reference;
-//! this is an independent digital filter, not its circuit or filter solver.
+//! Sample-free acid voice: analytic oscillator, pre-pole, resonant pole pair and DC blocker.
 use rb_model::{Note, Synth};
+#[cfg(test)]
 use std::f32::consts::PI;
-
-const OS: usize = 4;
-fn blep(t: f32, dt: f32) -> f32 {
-    if t < dt {
-        let x = t / dt;
-        x + x - x * x - 1.0
-    } else if t > 1.0 - dt {
-        let x = (t - 1.0) / dt;
-        x * x + x + x + 1.0
-    } else {
-        0.0
-    }
-}
+use std::f64::consts::TAU;
 
 pub struct AcidVoice {
     sr: f32,
-    phase: f32,
+    phase: f64,
     pitch: f32,
     target: f32,
     glide: bool,
@@ -29,108 +16,111 @@ pub struct AcidVoice {
     gate_samples: f32,
     accented: bool,
     vintage: bool,
-    attack: f32,
-    release: f32,
     glide_factor: f32,
-    hp: f32,
-    aa: f32,
-    cached_pitch: f32,
-    frequency: f32,
     decay_setting: f32,
     decay_factor: f32,
-    coeff_count: u8,
-    coeff_key: [f32; 4],
-    g: f32,
-    feedback: f32,
-    g_step: f32,
-    feedback_step: f32,
-    stages: [f32; 4],
-    feedback_low: f32,
-    decimate: [f32; 3],
-    last: f32,
-    dc_input: f32,
-    dc: f32,
-    dc_decay: f32,
+    accent_env: f32,
+    coefficients: [f64; 4],
+    coefficient_steps: [f64; 4],
+    coefficient_left: u16,
+    retrigger: bool,
+    cutoff_state: [f64; 2],
+    cutoff_initialized: bool,
+    smoothing_left: u16,
+    pre: f64,
+    body: [f64; 2],
+    dc_input: f64,
+    dc: f64,
 }
+
+// A standard damped pole pair, preceded by a one-pole low-pass. No coefficient ROM.
+fn poles(position: f64, resonance: f64, sr: f64) -> [f64; 4] {
+    let position = (position * 1023.).floor() / 1023.;
+    let hz =
+        (44100. * 0.4 / 1602. * 1602.0_f64.powf(position) * (0.6 + 0.4 * resonance)).min(sr * 0.4);
+    let blend = ((position * 1023.).powi(2) / 512000. - 0.3).clamp(0., 1.);
+    let q =
+        (0.5 + 7. / 6. * resonance) * (1. - blend) + 0.52 * 1.78_f64.powf(7. * resonance) * blend;
+    let angle = TAU * hz / sr;
+    let radius = (-angle / (2. * q)).exp();
+    let a = 2. * radius * angle.cos();
+    let b = radius * radius;
+    let pre = (-angle * (0.15 + 0.85 * resonance)).exp();
+    let gain = (1. - a + b) * (1. - pre) / (0.8 * (1. + if q > 4. { 3. } else { q }));
+    [a, b, gain, pre]
+}
+
 impl AcidVoice {
     pub fn new(sr: f32) -> Self {
-        let sr = sr.clamp(8000.0, 192000.0);
-        let osr = sr * OS as f32;
+        let sr = if sr.is_finite() {
+            sr.clamp(8000., 192000.)
+        } else {
+            44100.
+        };
         Self {
             sr,
-            phase: 0.0,
-            pitch: 36.0,
-            target: 36.0,
+            phase: 0.5,
+            pitch: 36.,
+            target: 36.,
             glide: false,
             pending_slide: false,
-            filter_env: 0.0,
-            amp: 0.0,
-            gate_samples: 0.0,
+            filter_env: 0.,
+            amp: 0.,
+            gate_samples: 0.,
             accented: false,
             vintage: false,
-            attack: 1.0 - (-1.0 / (0.003 * sr)).exp(),
-            release: 1.0 - (-1.0 / (0.006 * sr)).exp(),
-            glide_factor: 1.0 - (-1.0 / (0.012 * sr)).exp(),
-            hp: 1.0 - (-2.0 * PI * 150.0 / osr).exp(),
-            aa: 1.0 - (-2.0 * PI * (sr * 0.38) / osr).exp(),
-            cached_pitch: f32::NAN,
-            frequency: 0.0,
+            glide_factor: 1. - (-1. / (0.0167 * sr)).exp(),
             decay_setting: f32::NAN,
-            decay_factor: 0.0,
-            coeff_count: 0,
-            coeff_key: [f32::NAN; 4],
-            g: 0.0,
-            feedback: 0.0,
-            g_step: 0.0,
-            feedback_step: 0.0,
-            stages: [0.0; 4],
-            feedback_low: 0.0,
-            decimate: [0.0; 3],
-            last: 0.0,
-            dc_input: 0.0,
-            dc: 0.0,
-            dc_decay: (-2.0 * PI * 100.0 / osr).exp(),
+            decay_factor: 0.,
+            accent_env: 0.,
+            coefficients: [0.; 4],
+            coefficient_steps: [0.; 4],
+            coefficient_left: 0,
+            retrigger: false,
+            cutoff_state: [0.; 2],
+            cutoff_initialized: false,
+            smoothing_left: 0,
+            pre: 0.,
+            body: [0.; 2],
+            dc_input: 0.,
+            dc: 0.,
         }
     }
     pub fn clear(&mut self) {
         *self = Self::new(self.sr);
     }
-    pub fn note(&mut self, n: &Note, _cfg: &Synth, duration: f32, vintage: bool) {
-        let pitch = n.note as f32;
-        if !n.gate {
-            self.gate_samples = 0.0;
-            if n.slide {
-                self.pitch = pitch;
-                self.target = pitch;
-            }
-            self.pending_slide = n.slide;
-            return;
-        }
+    pub fn note(&mut self, note: &Note, _cfg: &Synth, duration: f32, vintage: bool) {
         let tied = self.pending_slide;
+        self.vintage = vintage;
+        self.accented = note.accent;
+        self.decay_setting = f32::NAN;
         if tied {
-            self.target = pitch;
+            self.target = note.note as f32;
             self.glide = true;
         } else {
-            self.pitch = pitch;
-            self.target = pitch;
+            self.pitch = note.note as f32;
+            self.target = self.pitch;
             self.glide = false;
-            self.filter_env = 1.0;
+            if note.gate {
+                self.filter_env = 1.;
+                self.retrigger = true;
+            }
         }
-        self.accented = n.accent;
-        self.vintage = vintage;
-        self.attack = 1.0 - (-1.0 / (if vintage { 0.00086 } else { 0.0005 } * self.sr)).exp();
-        self.release = 1.0 - (-1.0 / (if vintage { 0.00086 } else { 0.0223 } * self.sr)).exp();
-        self.coeff_count = 0;
-        self.pending_slide = n.slide;
-        self.gate_samples = if n.slide {
+        self.gate_samples = if note.gate && note.slide {
             f32::INFINITY
+        } else if note.gate || tied {
+            (duration.max(0.001) * 0.5 * self.sr).max(1.)
         } else {
-            (duration.max(0.001) * (if n.accent { 0.4 } else { 0.5 }) * self.sr).max(1.0)
+            0.
         };
+        if !note.gate && note.slide {
+            self.pitch = note.note as f32;
+            self.target = self.pitch;
+        }
+        self.pending_slide = note.slide;
+        self.coefficient_left = 0;
     }
     pub fn sample(&mut self, cfg: &Synth) -> f32 {
-        let sr = self.sr;
-        let osr = sr * OS as f32;
         if self.glide {
             self.pitch += (self.target - self.pitch) * self.glide_factor;
             if (self.target - self.pitch).abs() < 0.0001 {
@@ -138,120 +128,156 @@ impl AcidVoice {
                 self.glide = false;
             }
         }
-        let pitch = self.pitch + cfg.tune;
-        if pitch != self.cached_pitch {
-            self.frequency = (440.0 * 2.0_f32.powf((pitch - 69.0) / 12.0)).clamp(1.0, sr * 0.43);
-            self.cached_pitch = pitch;
-        }
-        let gated = self.gate_samples > 0.0;
-        let level = 0.72 + if self.accented { 0.8 * cfg.accent } else { 0.0 };
-        self.amp += ((if gated { level } else { 0.0 }) - self.amp)
-            * if gated { self.attack } else { self.release };
-        if self.gate_samples.is_finite() && self.gate_samples > 0.0 {
-            self.gate_samples -= 1.0;
-        }
-        // Vintage changes the original control rate, not the envelope time constant.
-        let decay = if self.accented {
-            0.2
+        let gated = self.gate_samples > 0.;
+        let smoothing = if self.vintage {
+            1. - (-1. / (0.00086 * self.sr)).exp()
+        } else if gated {
+            1.
         } else {
-            cfg.decay.max(0.01)
+            1. - (-1. / (0.0223 * self.sr)).exp()
         };
+        self.amp += (if gated { 1. } else { 0. } - self.amp) * smoothing;
+        if self.gate_samples.is_finite() && gated {
+            self.gate_samples -= 1.;
+        }
+        let decay = if self.accented { -1. } else { cfg.decay };
         if decay != self.decay_setting {
-            self.decay_factor = (-1.0 / (decay * sr)).exp();
+            let amount = ((cfg.decay - 0.05) / 0.75).clamp(0., 1.);
+            let rate = if self.accented {
+                13.67
+            } else {
+                44100. * (0.00001 + 0.0003 * (1. - amount).powi(2))
+            };
+            self.decay_factor = (-rate / self.sr).exp();
             self.decay_setting = decay;
         }
-        let env = self.filter_env;
         self.filter_env *= self.decay_factor;
-        if !gated && self.amp < 1e-7 {
-            self.amp = 0.0;
-            self.stages = [0.0; 4];
-            self.feedback_low = 0.0;
-            self.decimate = [0.0; 3];
-            self.last = 0.0;
-            self.dc = 0.0;
-            self.dc_input = 0.0;
-            return 0.0;
+        let resonance = cfg.resonance.clamp(0., 1.);
+        let accent_follow = 1. - ((0.98901 + resonance * 0.00999).ln() * (44100. / self.sr)).exp();
+        let accent_target = if self.accented {
+            self.filter_env * 3. * cfg.accent
+        } else {
+            0.
+        };
+        self.accent_env += (accent_target - self.accent_env) * accent_follow;
+        let silent = !gated && self.amp < 1e-7;
+        if silent {
+            self.amp = 0.;
         }
-        let key = [
-            cfg.cutoff,
-            cfg.resonance,
-            cfg.envelope,
-            if self.accented { cfg.accent } else { 0.0 },
-        ];
-        if self.coeff_count == 0 || key != self.coeff_key {
-            self.coeff_key = key;
-            self.coeff_count = if self.vintage { 4 } else { 16 };
-            let modulation = (cfg.envelope / 2400.0).clamp(0.0, 5.0);
-            let cutoff = (cfg.cutoff
-                * (0.25 + 0.25 * cfg.resonance.clamp(0.0, 1.0))
-                * 2.0_f32.powf(
-                    env * modulation
-                        * (1.0
-                            + if self.accented {
-                                0.65 * cfg.accent
-                            } else {
-                                0.0
-                            }),
-                ))
-            .clamp(25.0, sr * 0.42);
-            let r = cfg.resonance.clamp(0.0, 1.0);
-            let resonance = (1.0 - (-3.0 * r).exp()) / (1.0 - (-3.0_f32).exp());
-            // Frequency-compensated coefficients adapted from Open303 (MIT).
-            let wc = 2.0 * PI * cutoff / osr;
-            let (sn, cs) = wc.sin_cos();
-            let t = (0.25 * (wc - PI)).tan();
-            let a_full = t / (sn - cs * t);
-            let a0 = -(-wc).exp();
-            let a = resonance * a_full + (1.0 - resonance) * a0;
-            let g = (1.0 + a).clamp(0.0, 0.99);
-            let feedback = 3.98 * r;
-            self.g_step = (g - self.g) / self.coeff_count as f32;
-            self.feedback_step = (feedback - self.feedback) / self.coeff_count as f32;
+        if self.smoothing_left == 0 {
+            let cutoff = ((cfg.cutoff - 100.) / 5900.).clamp(0., 1.) as f64;
+            let target = 0.46 + cutoff * 0.29;
+            if !self.cutoff_initialized {
+                self.cutoff_state = [target; 2];
+                self.cutoff_initialized = true;
+            }
+            // The cutoff control has a slow underdamped response, independent of note envelopes.
+            let w: f64 = 0.0628;
+            let radius = (-w * 0.5).exp();
+            let a = 2. * radius * w.cos();
+            let b = radius * radius;
+            let cutoff =
+                a * self.cutoff_state[0] - b * self.cutoff_state[1] + (1. - a + b) * target;
+            self.cutoff_state = [cutoff, self.cutoff_state[0]];
+            self.smoothing_left = (64. * self.sr / 44100.).round().max(1.) as u16;
         }
-        self.coeff_count -= 1;
-        self.g += self.g_step;
-        self.feedback += self.feedback_step;
-        let (g, feedback, hp, aa) = (self.g, self.feedback, self.hp, self.aa);
-        for _ in 0..OS {
-            let dt = self.frequency / osr;
-            self.phase = (self.phase + dt).fract();
-            let saw = 2.0 * self.phase - 1.0 - blep(self.phase, dt);
-            let wave = match cfg.wave.as_str() {
-                "square" => {
-                    let duty = 0.523;
-                    let square = if self.phase < duty { 1.0 } else { -1.0 };
-                    (square + blep(self.phase, dt) - blep((self.phase + 1.0 - duty).fract(), dt))
-                        * 0.55
+        self.smoothing_left -= 1;
+        if self.coefficient_left == 0 {
+            let count = ((if self.vintage { 4. } else { 64. }) * self.sr / 44100.)
+                .round()
+                .max(1.) as u16;
+            let cutoff = self.cutoff_state[0];
+            let envmod = (cfg.envelope / 5000.).clamp(0., 1.) as f64;
+            let envelope = self.filter_env as f64 * (self.decay_factor as f64).powi(count as i32);
+            let accent = accent_target as f64
+                + (self.accent_env - accent_target) as f64
+                    * (1. - accent_follow as f64).powi(count as i32 - 1);
+            let amp_target = if gated { 1. } else { 0. };
+            let amp = amp_target
+                + (self.amp as f64 - amp_target) * (1. - smoothing as f64).powi(count as i32 - 1);
+            let position = (cutoff
+                + (envelope - 0.4) * (0.08 + 0.38 * envmod)
+                + accent * (0.101667 - resonance as f64 / 15.))
+                .clamp(0., 1.);
+            let row = resonance as f64 * if self.vintage { 7.999 } else { 7. };
+            let low = row.floor().min(7.);
+            let mut next = poles(position, low / 7., self.sr as f64);
+            if !self.vintage {
+                let high = poles(position, (low + 1.).min(7.) / 7., self.sr as f64);
+                // Modern sound blends resonance rows; Vintage keeps discrete settings.
+                let fraction = (row - low).clamp(0., 1.);
+                for i in 0..4 {
+                    next[i] += (high[i] - next[i]) * fraction;
                 }
-                "sine" => (2.0 * PI * self.phase).sin(),
-                "triangle" => 1.0 - 4.0 * (self.phase - 0.5).abs(),
-                _ => saw,
-            };
-            // Four-pole resonant digital low-pass with soft-limited feedback;
-            // coefficient, feedback and saturation are design choices, not a circuit simulation.
-            self.feedback_low += hp * (self.stages[3] - self.feedback_low);
-            let mut x = (wave * 1.15 - feedback * (self.stages[3] - self.feedback_low)).tanh();
-            for stage in &mut self.stages {
-                *stage += g * (x - *stage);
-                x = *stage;
             }
-            x = self.stages[3];
-            self.dc = x - self.dc_input + self.dc_decay * self.dc;
-            self.dc_input = x;
-            x = self.dc;
-            for stage in &mut self.decimate {
-                *stage += aa * (x - *stage);
-                x = *stage;
+            next[2] *= amp * (1. + accent);
+            if self.retrigger {
+                self.coefficients = next;
+                self.coefficients[2] = 0.;
+                self.retrigger = false;
             }
-            self.last = x;
+            if self.vintage {
+                self.coefficients = next;
+                self.coefficient_steps = [0.; 4];
+            } else {
+                for i in 0..4 {
+                    self.coefficient_steps[i] = (next[i] - self.coefficients[i]) / count as f64;
+                }
+            }
+            self.coefficient_left = count;
         }
-        self.last * self.amp * 0.35
+        let frequency = (440.
+            * 2.0_f64.powf((self.pitch as f64 + cfg.tune.round() as f64 - 69.) / 12.))
+        .clamp(1., self.sr as f64 * 0.43);
+        self.phase = (self.phase + frequency / self.sr as f64).fract();
+        let oscillator = match cfg.wave.as_str() {
+            "square" => {
+                if self.phase < 0.522888 {
+                    -0.549316
+                } else {
+                    0.549316
+                }
+            }
+            "sine" => (TAU * self.phase).sin(),
+            "triangle" => 1. - 4. * (self.phase - 0.5).abs(),
+            _ => 2. * self.phase - 1.,
+        };
+        let [a, b, g, p] = self.coefficients;
+        self.pre = oscillator + p * self.pre;
+        let y = self.pre * g + a * self.body[0] - b * self.body[1];
+        self.dc = y - self.dc_input + (-TAU * 100. / self.sr as f64).exp() * self.dc;
+        self.dc_input = y;
+        self.body = [y, self.body[0]];
+        for i in 0..4 {
+            self.coefficients[i] += self.coefficient_steps[i];
+        }
+        self.coefficient_left -= 1;
+        // The oscillator and input pole keep running between notes, including during silence.
+        if silent {
+            0.
+        } else {
+            self.dc as f32 / 2.18
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn silent_oscillator_preserves_phase_and_input_pole_history() {
+        let c = rb_model::Song::default().synth[0].clone();
+        let mut voice = AcidVoice::new(44100.);
+        let phase = voice.phase;
+        for _ in 0..137 {
+            assert_eq!(voice.sample(&c), 0.);
+        }
+        assert_ne!(voice.phase, phase);
+        assert!(voice.pre.is_finite() && voice.pre.abs() > 1e-5);
+        let phase = voice.phase;
+        voice.note(&note(48, true, false, false), &c, 0.125, false);
+        assert_eq!(voice.phase, phase);
+    }
     fn note(p: u8, gate: bool, accent: bool, slide: bool) -> Note {
         Note {
             note: p,
@@ -343,7 +369,7 @@ mod tests {
         c.resonance = 0.;
         c.envelope = 0.;
         let mut v = AcidVoice::new(48000.);
-        v.note(&note(69, true, false, true), &c, 1., false);
+        v.note(&note(45, true, false, true), &c, 1., false);
         for _ in 0..4800 {
             v.sample(&c);
         }
@@ -357,7 +383,7 @@ mod tests {
             }
             (re * re + im * im).sqrt()
         };
-        let ratio = magnitude(880.) / magnitude(440.);
+        let ratio = magnitude(220.) / magnitude(110.);
         assert!(
             (0.05..0.2).contains(&ratio),
             "second harmonic ratio {ratio}"
@@ -392,9 +418,9 @@ mod tests {
             }
             (re * re + im * im).sqrt()
         }
-        let a = magnitude(&lo[12000..], 1046.5);
-        let b = magnitude(&hi[12000..], 1046.5);
-        assert!(b > a, "resonance peak {a} {b}");
+        let a = magnitude(&lo[12000..], 392.438) / magnitude(&lo[12000..], 130.813);
+        let b = magnitude(&hi[12000..], 392.438) / magnitude(&hi[12000..], 130.813);
+        assert!(b > a * 2., "normalized resonance peak {a} {b}");
         let mut wav = Vec::new();
         let data: Vec<u8> = hi
             .iter()
@@ -420,15 +446,15 @@ mod tests {
     fn time_and_pitch_consistent_across_sample_rates() {
         for sr in [44100., 48000., 96000.] {
             let mut c = rb_model::Song::default().synth[0].clone();
-            c.decay = 1.;
+            c.decay = 0.05 + 0.75 * 64. / 127.;
             let mut v = AcidVoice::new(sr);
             v.note(&note(69, true, false, true), &c, 1., false);
             for _ in 0..(sr * 0.2) as usize {
                 v.sample(&c);
             }
-            assert!((v.filter_env - (-0.2_f32).exp()).abs() < 0.002);
+            assert!((v.filter_env - 0.477).abs() < 0.003);
             assert!((v.pitch - 69.).abs() < 0.001);
-            assert!(v.amp > 0.65 && v.amp < 0.8);
+            assert!((v.amp - 1.).abs() < 0.001);
         }
     }
     #[test]
@@ -442,7 +468,7 @@ mod tests {
         normal.note(&note(48, true, false, false), &c, 1.0, false);
         accent.note(&note(48, true, true, false), &c, 1.0, false);
         vintage.note(&note(48, true, false, false), &c, 1.0, true);
-        assert!(accent.gate_samples < normal.gate_samples);
+        assert_eq!(accent.gate_samples, normal.gate_samples);
         for _ in 0..4800 {
             normal.sample(&c);
             accent.sample(&c);

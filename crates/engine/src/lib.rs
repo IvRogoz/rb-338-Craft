@@ -404,6 +404,7 @@ impl Engine {
             } else {
                 1. - swing
             };
+        if t == 3 { self.flams[1] = [[0.;16];12]; self.flam_gain[1] = [[0.;16];12]; }
         if self.current.enabled[t] {
             if t < 2 {
                 self.voices[t].note(
@@ -415,22 +416,27 @@ impl Engine {
             } else {
                 let k = t - 2;
                 let p = &self.current.patterns[slot];
-                let accent = if p.drums[k][0][i] > 0 {
-                    1. + self.current.drums[k].voices[0].level * 0.65
-                } else {
-                    1.
-                };
-                // Order resolves simultaneous hats: 808 OH then CH; 909 CH then OH.
-                for id in 1..12 {
+                let accent = 1. + p.drums[k][0][i] as f32
+                    * self.current.drums[k].voices[0].level * 127. / 32.;
+                // The 909 triggers high instrument columns first, including OH before CH.
+                for order in 1..12 {
+                    let id = if k == 1 { 12-order } else { order };
                     let v = p.drums[k][id][i];
                     if v > 0 {
-                        let gain = accent * if v == 2 { 1. } else { 0.72 };
+                        let gain = accent * if k == 0 { 1. }
+                            else if v == 2 || v == 4 { 2. } else { 0.8 };
                         self.drums[k].trigger(id, gain, &self.current.drums[k]);
-                        if v == 3 {
-                            // A new flam must not replace earlier delayed hits.
-                            if let Some(index)=self.flams[k][id].iter().position(|time| *time<=0.) {
-                                self.flams[k][id][index]=self.current.drums[k].flam*self.sr;
-                                self.flam_gain[k][id][index]=gain*0.85;
+                        if v >= 3 {
+                            if let Some(index) = self.flams[k][id].iter().position(|time| *time <= 0.) {
+                                let quantum = self.sr * 64. / 44100.;
+                                let interval = if k == 1 {
+                                    let raw = rb_model::rbs::flam_control(self.current.drums[k].flam);
+                                    rb_model::rbs::flam_seconds(raw,self.current.bpm)*self.sr
+                                } else { self.current.drums[k].flam*self.sr };
+                                self.flams[k][id][index] = if k == 1 {
+                                    (interval/quantum).ceil()*quantum + 1.
+                                } else { interval };
+                                self.flam_gain[k][id][index] = if k == 1 { accent*1.5 } else { gain*0.85 };
                             }
                         }
                     }
@@ -467,7 +473,8 @@ impl Engine {
                 ch[i] = self.voices[i].sample(&self.current.synth[i]);
             }
             for k in 0..2 {
-                for id in 1..12 {
+                for order in 1..12 {
+                    let id = if k == 1 {12-order} else {order};
                     for index in 0..16 {
                         if self.flams[k][id][index]>0. {
                             self.flams[k][id][index]-=1.;
@@ -961,6 +968,29 @@ mod tests {
         let out = render(&mut e, 0.4);
         assert!(out[out.len() - 512..].iter().all(|x| x.abs() < 1e-6));
     }
+    #[test]
+    fn legacy_909_flams_follow_tempo_strength_and_new_step_cancellation() {
+        for (control,bpm,frames) in [(0,120.,256.),(64,120.,1408.),(127,120.,2688.),(64,240.,1344.)] {
+            let mut song=Song::default();song.bpm=bpm;
+            song.drums[1].flam=0.005+control as f32/127.*0.095;
+            let slot=song.slots[3];
+            for row in &mut song.patterns[slot].drums[1] {row.fill(0);}
+            song.patterns[slot].drums[1][2][0]=4;
+            let mut e=Engine::new(44100.);e.set_song(song);
+            e.track_boundary(3);
+            assert_eq!(e.flams[1][2][0],frames+1.,"{control}:{bpm}");
+            assert_eq!(e.flam_gain[1][2][0],1.5);
+            e.render(&mut vec![0.;frames as usize*2]);
+            assert_eq!(e.flams[1][2][0],1.);
+            e.render(&mut [0.;2]);
+            assert_eq!(e.flams[1][2][0],0.);
+            e.track_step[3]=0;e.track_boundary(3);
+            assert!(e.flams[1][2][0]>0.);
+            e.track_boundary(3);
+            assert!(e.flams[1].iter().flatten().all(|time|*time==0.));
+        }
+    }
+
     #[test]
     fn repeated_flams_keep_earlier_delayed_hits() {
         let mut s=Song::default();s.bpm=500.;s.drums[0].flam=0.2;s.patterns[s.slots[2]].drums[0][1].fill(3);

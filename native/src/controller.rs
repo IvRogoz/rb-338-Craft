@@ -457,7 +457,7 @@ fn record_control(a: &mut Controller, key: &str, v: f64) {
             };
             (3 + k as u8, (c + 2) as u8, (x * 127.).round() as u8)
         }
-        "kit" if p[2] == "flam" => (4, 29, (((v - 0.005) / 0.095) * 127.).round() as u8),
+        "kit" if p[2] == "flam" => (4, 29, rb_model::rbs::flam_control(v as f32)),
         "fx" => {
             let (t, c, x) = match p[1] {
                 "delay_feedback" => (5, 3, v),
@@ -756,7 +756,11 @@ fn perform_action(a: &mut Controller, action: &str) -> bool {
             let k = idx(1).min(1);
             let v = idx(2).min(11);
             let n = &mut a.song.patterns[a.song.slots[k + 2]].drums[k][v][idx(3).min(15)];
-            *n = if k == 1 && a.flam {
+            *n = if k == 1 && v != 0 && a.flam {
+                match *n { 0 | 1 => 3, 2 => 4, _ => 0 }
+            } else if k == 1 && v != 0 {
+                match *n { 0 => 1, 1 => 2, 3 => 4, _ => 0 }
+            } else if k == 1 && a.flam {
                 if *n == 3 {
                     0
                 } else {

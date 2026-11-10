@@ -290,8 +290,8 @@ impl Song {
                 || p.notes
                     .iter()
                     .any(|n| n.len() != 16 || n.iter().any(|s| s.note > 127))
-                || p.drums.iter().any(|d| {
-                    d.len() != 12 || d.iter().any(|r| r.len() != 16 || r.iter().any(|v| *v > 3))
+                || p.drums.iter().enumerate().any(|(k, d)| {
+                    d.len() != 12 || d.iter().any(|r| r.len() != 16 || r.iter().any(|v| *v > 3 + k as u8))
                 })
             {
                 return fail();
@@ -386,6 +386,18 @@ mod tests {
             s,
             Song::from_json(&serde_json::to_string(&s).unwrap()).unwrap()
         );
+    }
+    #[test]
+    fn strong_909_flam_roundtrips_and_other_out_of_range_hits_fail() {
+        let mut s = Song::default();
+        s.patterns[0].drums[1][1][0] = 4;
+        s.validate().unwrap();
+        assert_eq!(s, Song::from_json(&serde_json::to_string(&s).unwrap()).unwrap());
+        s.patterns[0].drums[0][1][0] = 4;
+        assert!(s.validate().is_err());
+        s.patterns[0].drums[0][1][0] = 0;
+        s.patterns[0].drums[1][1][0] = 5;
+        assert!(s.validate().is_err());
     }
     #[test]
     fn reject_bad_bank() {

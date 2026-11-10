@@ -1,6 +1,12 @@
 //! Generated percussion: reduced sound models, not recordings or circuit solvers.
 use rb_model::DrumKit;
 use std::f32::consts::TAU;
+#[path = "percussion_color.rs"]
+mod color;
+#[path = "percussion_kicks.rs"]
+mod kicks;
+#[path = "percussion_modes.rs"]
+mod membranes;
 
 #[derive(Clone, Copy)]
 struct Voice {
@@ -8,22 +14,35 @@ struct Voice {
     body: f32,
     noise: f32,
     age: u32,
+    hold: u32,
+    colored: bool,
+    banked: bool,
+    seed: u32,
     phase: [f32; 6],
     freq: [f32; 6],
     fall: f32,
     body_fall: f32,
     noise_fall: f32,
     noise_cut: f32,
-    noise_low: f32,
-    noise_mix: f32,
     pitch: f32,
     pitch_fall: f32,
-    low: f32,
-    high: f32,
     tone_state: f32,
     tone_setting: f32,
     band: Band,
-    modes: [Mode; 32],
+    banks: [Band; 8],
+    color_gain: [f32; 8],
+    color_fall: [f32; 8],
+    color_hp: [[f32; 2]; 8],
+    color_hp_alpha: f32,
+    source_step: f64,
+    source_phase: f64,
+    source_age: u32,
+    source_pair: [f32; 2],
+    modes: [Mode; 8],
+    mode_count: u8,
+    mode_pulse: [f32; 2],
+    mode_pulse_fall: [f32; 2],
+    mode_end: f32,
     velocity: f32,
     variant: bool,
 }
@@ -34,22 +53,35 @@ impl Default for Voice {
             body: 0.,
             noise: 0.,
             age: 0,
+            hold: 0,
+            colored: false,
+            banked: false,
+            seed: 1,
             phase: [0.; 6],
             freq: [0.; 6],
             fall: 0.,
             body_fall: 0.,
             noise_fall: 0.,
             noise_cut: 0.,
-            noise_low: 0.,
-            noise_mix: 0.,
             pitch: 0.,
             pitch_fall: 0.,
-            low: 0.,
-            high: 0.,
             tone_state: 0.,
             tone_setting: f32::NAN,
             band: Band::default(),
-            modes: [Mode::default(); 32],
+            banks: [Band::default(); 8],
+            color_gain: [0.; 8],
+            color_fall: [0.; 8],
+            color_hp: [[0.; 2]; 8],
+            color_hp_alpha: 0.,
+            source_step: 0.,
+            source_phase: 0.,
+            source_age: 0,
+            source_pair: [0.; 2],
+            modes: [Mode::default(); 8],
+            mode_count: 0,
+            mode_pulse: [0.; 2],
+            mode_pulse_fall: [0.; 2],
+            mode_end: 0.,
             velocity: 0.,
             variant: false,
         }
@@ -62,6 +94,9 @@ struct Mode {
     step: f32,
     amp: f32,
     fall: f32,
+    pitch: f32,
+    pitch_fall: f32,
+    curve: f32,
 }
 #[derive(Clone, Copy, Default)]
 struct Band {
@@ -95,16 +130,118 @@ impl Band {
     }
 }
 
+fn colored_noise(v: &mut Voice, decay: bool) -> f32 {
+    let mut out = 0.;
+    for i in 0..8 {
+        v.seed ^= v.seed << 13;
+        v.seed ^= v.seed >> 17;
+        v.seed ^= v.seed << 5;
+        let noise = v.seed as f32 / u32::MAX as f32 * 2. - 1.;
+        let state = &mut v.color_hp[i];
+        state[0] += v.color_hp_alpha * (noise - state[0]);
+        let high = noise - state[0];
+        state[1] += v.color_hp_alpha * (high - state[1]);
+        out += v.banks[i].process(high - state[1]) * v.color_gain[i];
+        if decay {
+            v.color_gain[i] *= v.color_fall[i];
+        }
+    }
+    out
+}
+
+fn colored_signal(v: &mut Voice, t: f32, kit: usize, id: usize) -> f32 {
+    let [_, _, attack, _, hold, end] = v.freq;
+    if t >= end {
+        if v.colored {
+            v.env = 0.;
+            v.body = 0.;
+        } else {
+            v.noise = 0.;
+        }
+        return 0.;
+    }
+    let excitation = colored_noise(v, t >= hold);
+    let mut envelope = (t / attack).min(1.) * ((end - t) / 0.01).clamp(0., 1.);
+    if kit == 0 && id == 7 && !v.variant {
+        envelope = 0.;
+        for (start, amp) in [(0., 1.), (0.011, 0.8), (0.023, 0.7), (0.033, 0.9)] {
+            if t >= start {
+                envelope += amp * (-(t - start) / if start < 0.03 { 0.003 } else { 0.025 }).exp();
+            }
+        }
+    }
+    if kit == 1 && id == 7 {
+        let burst = if t < 0.008 {
+            0.4
+        } else if (0.014..0.022).contains(&t) {
+            0.65
+        } else if (0.030..0.045).contains(&t) {
+            1.
+        } else {
+            0.
+        };
+        envelope = burst
+            + 0.35 * (-std::f32::consts::LN_10 * t / 0.14).exp()
+            + 0.1 * (-std::f32::consts::LN_10 * t / 0.35).exp();
+    }
+    if v.colored {
+        v.body = v.color_gain.iter().copied().fold(0., f32::max) * envelope * v.env;
+        if t > 0.1 && v.body < 1e-7 {
+            v.body = 0.;
+            v.env = 0.;
+        }
+    }
+    excitation * envelope
+}
+
+fn pitched_color(v: &mut Voice, kit: usize, id: usize) -> f32 {
+    if v.source_age == 0 {
+        v.source_pair[0] = colored_signal(v, 0., kit, id);
+        v.source_pair[1] = colored_signal(v, 1. / 44100., kit, id);
+        v.source_age = 2;
+    }
+    let out = v.source_pair[0] + (v.source_pair[1] - v.source_pair[0]) * v.source_phase as f32;
+    v.source_phase += v.source_step;
+    while v.source_phase >= 1. {
+        v.source_phase -= 1.;
+        v.source_pair[0] = v.source_pair[1];
+        v.source_pair[1] = colored_signal(v, v.source_age as f32 / 44100., kit, id);
+        v.source_age = v.source_age.saturating_add(1);
+    }
+    out
+}
+
+fn membrane_sample(v: &mut Voice, sr: f32) -> f32 {
+    let t = v.age as f32 / sr;
+    let mut out = 0.;
+    let mut envelope = 0.;
+    for mode in &mut v.modes[..v.mode_count as usize] {
+        let amplitude = mode.amp * (-mode.curve * t * t).exp();
+        out += (TAU * mode.phase).sin() * amplitude;
+        envelope += amplitude.abs();
+        mode.phase = (mode.phase + mode.step + mode.pitch).fract();
+        mode.pitch *= mode.pitch_fall;
+        mode.amp *= mode.fall;
+    }
+    for i in 0..2 {
+        out += v.mode_pulse[i];
+        envelope += v.mode_pulse[i].abs();
+        v.mode_pulse[i] *= v.mode_pulse_fall[i];
+    }
+    let fade = ((v.mode_end - t) / 0.005).clamp(0., 1.);
+    v.body = envelope * fade * v.env;
+    if t >= v.mode_end || v.body < 1e-7 {
+        v.body = 0.;
+        v.env = 0.;
+    }
+    out * fade * v.env
+}
+
 pub struct DrumSynth {
     sr: f32,
     kit: usize,
     voices: [Voice; 12],
-    metal: [f32; 6],
-    rng: u32,
-    closed_now: bool,
-    metal_band: Band,
-    noise_alpha: [f32; 2],
-    tone_alpha: [f32; 65],
+    kick_tail: Option<Voice>,
 }
 impl DrumSynth {
     pub fn new(sr: f32, kit: usize) -> Self {
@@ -117,20 +254,12 @@ impl DrumSynth {
             sr,
             kit: kit.min(1),
             voices: [Voice::default(); 12],
-            metal: [0.; 6],
-            rng: 0x5831a17d,
-            closed_now: false,
-            metal_band: Band::new(7100., 1.5, sr),
-            noise_alpha: [lp(1500., sr), lp(6000., sr)],
-            tone_alpha: std::array::from_fn(|i| lp(180. + i as f32 / 64. * 4500., sr)),
+            kick_tail: None,
         }
     }
     pub fn clear(&mut self) {
         self.voices = [Voice::default(); 12];
-        self.metal = [0.; 6];
-        self.metal_band = Band::new(7100., 1.5, self.sr);
-        self.closed_now = false;
-        self.rng = 0x5831a17d;
+        self.kick_tail = None;
     }
     pub fn trigger(&mut self, id: usize, velocity: f32, kit: &DrumKit) {
         if id == 0 || id >= 12 || kit.voices.len() != 12 || !velocity.is_finite() {
@@ -138,234 +267,176 @@ impl DrumSynth {
         }
         let d = &kit.voices[id];
         let sr = self.sr;
-        let gain = velocity.clamp(0., 3.);
-        let tune = 2.0_f32.powf(d.tune.clamp(-24., 24.) / 12.);
-        // The 808 and 909 choose opposite priorities when hats are simultaneous.
+        let gain = velocity.clamp(0., 64.);
+        // A closed hat shortens the open tail; it does not erase the other voice.
         if self.kit == 0 {
             if id == 11 {
-                self.voices[10].body_fall = decay(0.004, sr);
-                self.voices[10].noise_fall = decay(0.004, sr);
-                self.voices[10].fall = decay(0.004, sr);
-                self.closed_now = true;
+                self.voices[10].hold = 0;
+                self.voices[10].fall = 0.998_f32.powf(44100. / (2. * sr));
             }
         } else {
             if id == 8 {
-                self.voices[9] = Voice::default();
-            }
-            if id == 9 {
-                self.voices[8] = Voice::default();
+                self.voices[9].hold = 0;
+                self.voices[9].fall = 0.996_f32.powf(44100. / (2. * sr));
             }
         }
-        let old = self.voices[id];
         let mut v = Voice {
             env: 1.,
             body: 1.,
             noise: 1.,
             velocity: gain,
             variant: d.variant,
-            band: Band::new(
-                if id == 8 && self.kit == 0 {
-                    750.
-                } else {
-                    1800.
-                },
-                0.9,
-                sr,
-            ),
             ..Voice::default()
         };
-        if self.kit == 0 {
-            match id {
-                1 => {
-                    v.phase[0] = old.phase[0];
-                    v.freq[0] = 51.5;
-                    v.body = (old.body * 0.35 + 1.).min(1.5);
-                    v.body_fall = decay(0.055 + (d.decay.clamp(0.3, 2.) - 0.3) / 1.7 * 0.535, sr);
-                    v.pitch = 1.;
-                    v.pitch_fall = decay(0.006, sr);
-                    v.noise_fall = decay(0.004, sr);
-                    v.fall = decay(0.8, sr);
-                }
-                2 => {
-                    v.freq = [178., 332., 0., 0., 0., 0.];
-                    let tone = (d.tune / 12. + 0.5).clamp(0., 1.);
-                    v.phase[0] = 0.8 - 0.1 * tone;
-                    v.phase[1] = 0.505 + 0.11 * tone;
-                    // The higher body resonance dies away before the lower one.
-                    v.body_fall = decay(0.067, sr);
-                    v.pitch = 1.;
-                    v.pitch_fall = decay(0.014 + 0.009 * tone, sr);
-                    v.noise_fall = decay(0.060, sr);
-                    v.fall = v.noise_fall;
-                }
-                3..=5 => {
-                    let j = id - 3;
-                    let f = if d.variant {
-                        [183., 269., 381.][j]
-                    } else {
-                        [90., 135., 185.][j]
-                    };
-                    v.freq[0] = f * tune;
-                    v.body_fall = decay(
-                        if d.variant {
-                            [0.180, 0.082, 0.080][j]
-                        } else {
-                            [0.200, 0.130, 0.100][j]
-                        },
-                        sr,
-                    );
-                    v.noise_fall = decay(0.22, sr);
-                    v.pitch = if d.variant { 0.0 } else { 0.28 };
-                    v.pitch_fall = decay(0.030, sr);
-                    v.fall = v.body_fall;
-                }
-                6 => {
-                    if d.variant {
-                        v.freq[0] = 2500.;
-                        v.body_fall = decay(0.025, sr)
-                    } else {
-                        v.freq[0] = 455.;
-                        v.freq[1] = 1667.;
-                        v.body_fall = decay(0.010, sr)
-                    }
-                    v.fall = v.body_fall;
-                }
-                7 => {
-                    v.noise_fall = decay(if d.variant { 0.03 } else { 0.10 }, sr);
-                    v.fall = v.noise_fall;
-                }
-                8 => {
-                    v.freq[0] = 536.;
-                    v.freq[1] = 808.;
-                    v.band = Band::new(950., 1.8, sr);
-                    v.body_fall = decay(0.35, sr);
-                    v.noise_fall = decay(0.035, sr);
-                    v.fall = v.body_fall;
-                }
-                9 => {
-                    v.body_fall = decay(0.10 + (d.decay.clamp(0.3, 2.) - 0.3) / 1.7 * 0.37, sr);
-                    v.noise_fall = decay(0.046, sr);
-                    v.fall = v.body_fall;
-                }
-                10 => {
-                    v.body_fall = decay(
-                        if self.closed_now {
-                            0.004
-                        } else {
-                            0.04 + (d.decay.clamp(0.3, 2.) - 0.3) / 1.7 * 0.68
-                        },
-                        sr,
-                    );
-                    v.noise_fall = decay(if self.closed_now { 0.004 } else { 0.035 }, sr);
-                    v.fall = v.body_fall;
-                }
-                11 => {
-                    v.body_fall = decay(0.030, sr);
-                    v.noise_fall = decay(0.012, sr);
-                    v.fall = v.body_fall;
-                }
-                _ => {}
+        if id == 1 {
+            let raw = (((d.tune + 6.) / 12. * 127.).round() as usize).min(127);
+            let shape = &kicks::KICKS[if self.kit == 0 { 0 } else { 1 + raw / 32 }];
+            let [base, fast, fast_time, slow, slow_time] = shape.pitch;
+            v.pitch = 1.;
+            v.noise = 1.;
+            v.pitch_fall = (-1. / (fast_time * sr)).exp();
+            v.noise_fall = (-1. / (slow_time * sr)).exp();
+            let alpha = if self.kit == 0 {
+                tone_alpha(d.tone, sr)
+            } else {
+                let index = ((d.attack.clamp(0., 1.) * 8.) as usize).min(7);
+                1. - [0.92_f32, 0.87, 0.8, 0.72, 0.62, 0.5, 0.3, 0.001][index].powf(44100. / sr)
+            };
+            v.freq = [
+                base / sr,
+                fast * fast_time * (1. - v.pitch_fall),
+                slow * slow_time * (1. - v.noise_fall),
+                shape.envelope[0],
+                shape.envelope[1],
+                alpha,
+            ];
+            for (mode, [amp, phase]) in v.modes.iter_mut().zip(shape.harmonics) {
+                mode.amp = amp;
+                mode.phase = phase;
             }
-        } else {
-            match id {
-                1 => {
-                    v.freq[0] = 58. * tune;
-                    v.body_fall = decay(0.055 + d.decay.clamp(0.3, 2.) * 0.20, sr);
-                    v.pitch = 1.1;
-                    v.pitch_fall = decay(0.035, sr);
-                    v.noise_fall = decay(0.006, sr);
-                    v.fall = v.body_fall;
-                }
-                2 => {
-                    v.freq[0] = 172. * tune;
-                    v.freq[1] = 238. * tune;
-                    v.phase[0] = 0.4;
-                    v.phase[1] = 0.72;
-                    v.body_fall = decay(0.068 / tune.sqrt(), sr);
-                    v.noise_fall = decay(0.035 + 0.13 * d.tone.clamp(0., 1.), sr);
-                    v.pitch = 0.1;
-                    v.pitch_fall = decay(0.020, sr);
-                    v.fall = decay(0.027 / tune, sr);
-                }
-                3..=5 => {
-                    v.freq[0] = [90., 112., 128.][id - 3] * tune;
-                    v.freq[1] = [60., 76., 96.][id - 3] * tune;
-                    v.body_fall = decay(
-                        (0.05 + d.decay.clamp(0.3, 2.) * 0.12) * [1.0, 0.77, 1.0][id - 3],
-                        sr,
-                    );
-                    v.noise_fall = decay(0.022, sr);
-                    v.pitch = 0.5;
-                    v.pitch_fall = decay(0.025, sr);
-                    v.fall = v.body_fall;
-                }
-                6 => {
-                    v.freq[0] = 223.;
-                    v.freq[1] = 480.;
-                    v.freq[2] = 1037.;
-                    v.phase[..3].copy_from_slice(&[0.637, 0.654, 0.494]);
-                    v.body_fall = decay(0.042, sr);
-                    v.noise_fall = decay(0.030, sr);
-                    v.pitch = 1.;
-                    v.pitch_fall = decay(0.010, sr);
-                    v.fall = v.body_fall;
-                }
-                7 => {
-                    v.noise_fall = decay(0.14, sr);
-                    v.body_fall = decay(0.35, sr);
-                    v.fall = v.noise_fall;
-                }
-                8..=11 => {
-                    let seconds = match id {
-                        8 => 0.025 + d.decay.clamp(0.3, 2.) * 0.035,
-                        9 => 0.12 + d.decay.clamp(0.3, 2.) * 0.28,
-                        10 => 1.4 / tune,
-                        _ => 0.65 / tune,
-                    };
-                    // Inharmonic resonators and filtered noise; no stored audio or waveform tables.
-                    for i in 0..32 {
-                        let x = i as f32;
-                        let base = match id {
-                            8 | 9 => 2300. + x * 260. + (x * x * 19.) % 370.,
-                            10 => 460. + x * 295. + (x * x * 31.) % 450.,
-                            _ => 650. + x * 550. + (x * x * 23.) % 390.,
-                        };
-                        let freq = base * if id >= 10 { tune } else { 1. };
-                        let weight = if id == 11 {
-                            0.08 + (-0.5 * ((freq - 8000.) / 3000.).powi(2)).exp()
-                        } else {
-                            0.5 + ((i * 17 % 11) as f32) / 20.
-                        };
-                        let duration = seconds * (0.55 + 0.45 / (1. + x * 0.08));
-                        v.modes[i] = Mode {
-                            phase: (x * 0.137).fract(),
-                            step: if freq < sr * 0.46 { freq / sr } else { 0. },
-                            amp: if freq < sr * 0.46 { weight / 20. } else { 0. },
-                            fall: decay(duration, sr),
-                        };
-                    }
-                    v.body_fall = decay(seconds, sr);
-                    v.noise_fall = decay(if id < 10 { 0.035 } else { 0.11 }, sr);
-                    v.fall = v.body_fall;
-                }
-                _ => {}
-            }
-        }
-        // Shape generated noise to the reference band balance, without storing audio.
-        let noise_shape = match (self.kit, id) {
-            (0, 2) => Some((3066., 0.737, 1644., 0.349)),
-            (0, 9) => Some((6823. * (1. + 0.59 * d.tone), 0.898, 10., 0.172)),
-            (0, 10) => Some((8648., 2.689, 6000., 0.001)),
-            (1, 2) => Some((7000., 1.15, 10., 0.04)),
-            (1, 7) => Some((839., 2.347, 1480., 0.016)),
-            (1, 11) => Some((7217., 1.186, 10., 0.409)),
-            _ => None,
-        };
-        if let Some((hz, q, highpass, mix)) = noise_shape {
-            v.band = Band::new(hz.min(sr * 0.45), q, sr);
-            v.noise_cut = lp(highpass, sr);
-            v.noise_mix = mix;
+            v.mode_pulse = shape.pulse;
+            v.mode_pulse_fall = [(-1. / (0.002 * sr)).exp(), (-1. / (0.010 * sr)).exp()];
+            v.mode_end = shape.end;
             v.tone_setting = d.tone;
+            v.fall = drum_decay(d.decay, sr, self.kit);
+            // Alternate two kicks so a retrigger fades the previous tail instead of cutting it.
+            let mut old = self.voices[1];
+            old.fall = 0.99_f32.powf(44100. / (2. * sr));
+            old.hold = 0;
+            self.kick_tail = Some(old);
+        } else if self.kit == 0 && id == 8 {
+            v.freq[0] = 537.279;
+            v.freq[1] = 809.69;
+            v.band = Band::new(850., 2.3, sr);
+            v.body = 0.09644592;
+            v.noise = 0.5257373;
+            v.body_fall = (-6.587016 / sr).exp();
+            v.noise_fall = (-90.97862 / sr).exp();
+            v.fall = 1.;
+            v.mode_end = 1.1609977;
+        }
+        if let Some(shape) = membranes::shape(self.kit, id, d.variant, d.tune) {
+            let raw = ((d.tune + 6.) / 12. * 127.).round();
+            let speed = if (3..=5).contains(&id) {
+                (256. * 2.0_f32.powf((raw - 64.) / if self.kit == 0 { 192. } else { 144. })).floor()
+                    / 256.
+            } else {
+                1.
+            };
+            v.mode_count = shape.modes.len() as u8;
+            for (mode, params) in v.modes.iter_mut().zip(shape.modes) {
+                let [hz, pitch, tau, rate, curve, amp, phase] = *params;
+                *mode = Mode {
+                    phase: phase.rem_euclid(1.),
+                    step: hz * speed / sr,
+                    amp,
+                    fall: (-rate * speed / sr).exp(),
+                    pitch: pitch * speed / sr,
+                    pitch_fall: (-speed / (tau * sr)).exp(),
+                    curve: curve * speed * speed,
+                };
+            }
+            v.mode_pulse = shape.pulse;
+            v.mode_pulse_fall = [(-speed / (0.001 * sr)).exp(), (-speed / (0.005 * sr)).exp()];
+            v.mode_end = shape.end / speed;
+            v.fall = if self.kit == 1 && (3..=5).contains(&id) {
+                drum_decay(d.decay, sr, 1)
+            } else {
+                1.
+            };
+            v.body_fall = 1.;
+            v.noise = 0.;
+            v.noise_fall = 0.;
+            v.pitch = 0.;
+            v.pitch_fall = 0.;
+        }
+        if let Some(shape) = color::shape(self.kit, id, d.variant) {
+            v.colored = id != 2;
+            v.banked = true;
+            v.seed = 0x5831a17d ^ (id as u32 * 0x1000193) ^ self.kit as u32;
+            let raw_tune = ((d.tune + 6.) / 12. * 127.).round();
+            let speed = if self.kit == 1 && id >= 10 {
+                (256. * 2.0_f32.powf((raw_tune - 64.) / 144.)).floor() / 256.
+            } else {
+                1.
+            };
+            // Pitch the procedurally generated source through a two-frame interpolator.
+            let pitched = self.kit == 1 && id >= 10;
+            let generator_rate = if pitched { 44100. } else { sr };
+            let generator_speed = if pitched { 1. } else { speed };
+            v.source_step = if pitched {
+                speed as f64 * 44100. / sr as f64
+            } else {
+                0.
+            };
+            for i in 0..8 {
+                let [hz, q, amp, tau] = shape.bands[i];
+                v.banks[i] = Band::new(hz * generator_speed, q, generator_rate);
+                v.color_gain[i] = amp * (generator_rate / (44100. * generator_speed)).sqrt();
+                v.color_fall[i] = (-generator_speed / (tau * generator_rate)).exp();
+            }
+            v.color_hp_alpha = lp(shape.highpass_hz * generator_speed, generator_rate);
+            // Start a noise excitation in its stationary state; the envelope supplies the attack.
+            for _ in 0..(generator_rate * 0.006).round() as usize {
+                colored_noise(&mut v, false);
+            }
+            v.freq = [
+                0.,
+                0.,
+                shape.attack / generator_speed,
+                0.,
+                shape.hold / generator_speed,
+                shape.end / generator_speed,
+            ];
+            v.env = 1.;
+            v.noise = 0.;
+            v.noise_fall = 0.;
+            v.body_fall = 1.;
+            v.fall = 1.;
+            v.noise_cut = 0.;
+            if id == 2 {
+                v.noise = 1.;
+                v.noise_fall = if self.kit == 0 {
+                    1.
+                } else {
+                    0.998_f32.powf(44100. / (2. * sr))
+                };
+                v.hold = if self.kit == 0 {
+                    0
+                } else {
+                    ((d.tone.clamp(0., 1.) * 127. + 30.) * 64. * sr / 44100.).round() as u32
+                };
+            } else if self.kit == 0 && id == 9 {
+                v.noise_cut = tone_alpha(d.tone, sr);
+                v.tone_setting = d.tone;
+                v.fall = drum_decay(d.decay, sr, 0);
+            } else if self.kit == 0 && id == 10 {
+                let raw = (((d.decay - 0.3) / 1.7).clamp(0., 1.) * 127.).round();
+                v.hold = (4. * raw * 64. * sr / 44100.).round() as u32;
+                v.fall = 0.998_f32.powf(44100. / (2. * sr));
+            } else if self.kit == 1 && (id == 8 || id == 9) {
+                v.fall = drum_decay(d.decay, sr, if id == 8 { 8 } else { 1 });
+            }
         }
         self.voices[id] = v;
     }
@@ -374,15 +445,6 @@ impl DrumSynth {
             return 0.;
         }
         let sr = self.sr;
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 17;
-        self.rng ^= self.rng << 5;
-        let noise = (self.rng as f32 / u32::MAX as f32) * 2. - 1.;
-        let mut metal = 0.;
-        for (i, f) in [205.3, 369.6, 304.4, 522.7, 800., 540.].iter().enumerate() {
-            metal += square(&mut self.metal[i], *f / sr) / 6.;
-        }
-        let hi = self.metal_band.process(metal);
         let mut out = 0.;
         for id in 1..12 {
             let d = &kit.voices[id];
@@ -390,200 +452,156 @@ impl DrumSynth {
             if v.env < 1e-6 && v.body < 1e-6 && v.noise < 1e-6 {
                 continue;
             }
-            // One shared generated noise source; two one-pole states split high and low bands.
-            v.low += self.noise_alpha[0] * (noise - v.low);
-            v.high += self.noise_alpha[1] * (noise - v.high);
-            let bright = v.high - v.low;
-            let air = noise - v.low;
-            let sizzle = noise - v.high;
+            let t = v.age as f32 / sr;
             if self.kit == 0 && id == 9 && d.tone != v.tone_setting {
-                let band = Band::new(6823. * (1. + 0.59 * d.tone), 0.898, sr);
-                v.band.b = band.b;
-                v.band.a1 = band.a1;
-                v.band.a2 = band.a2;
+                v.noise_cut = tone_alpha(d.tone, sr);
                 v.tone_setting = d.tone;
             }
-            let texture = if v.noise_cut > 0. {
-                v.noise_low += v.noise_cut * (noise - v.noise_low);
-                let ring = if self.kit == 0 && (id == 9 || id == 10) {
-                    metal * 0.8
+            if self.kit == 0 && id == 1 && d.tone != v.tone_setting {
+                v.freq[5] = tone_alpha(d.tone, sr);
+                v.tone_setting = d.tone;
+            }
+            let texture = if v.banked && !v.colored {
+                colored_signal(v, t, self.kit, id)
+            } else {
+                0.
+            };
+            let sound = if v.mode_count > 0 {
+                let body = membrane_sample(v, sr);
+                let snappy = d.snappy.clamp(0., 1.);
+                body + if id == 2 {
+                    texture
+                        * v.noise
+                        * if self.kit == 0 {
+                            snappy * snappy
+                        } else {
+                            1.27 * snappy
+                        }
                 } else {
                     0.
-                };
-                v.band.process(noise - v.noise_low + ring) + sizzle * v.noise_mix
-            } else {
-                bright
-            };
-            let t = v.age as f32 / sr;
-            let wave = |v: &mut Voice, i: usize, ratio: f32| {
-                v.phase[i] = (v.phase[i] + v.freq[i] * ratio / sr).fract();
-                (TAU * v.phase[i]).sin()
-            };
-            let sound = if self.kit == 0 {
-                match id {
-                    1 => {
-                        let f = 1. + v.pitch + 0.06 * v.body;
-                        let body = wave(v, 0, f) * v.body;
-                        let click = (noise - v.high) * v.noise;
-                        let tone = d.tone.clamp(0., 1.);
-                        v.tone_state +=
-                            self.tone_alpha[(tone * 64.) as usize] * (body - v.tone_state);
-                        v.tone_state * 0.8 + click * (0.04 + tone * 0.25)
-                    }
-                    2 => {
-                        let a = wave(v, 0, 1.);
-                        let b = wave(v, 1, 1.);
-                        // The 808 Tone control blends fixed body resonances rather than transposing them.
-                        let tone = (d.tune / 12. + 0.5).clamp(0., 1.);
-                        let snappy = d.snappy.clamp(0., 1.);
-                        a * (0.9 - 1.05 * tone + 0.4 * tone * tone) * v.body
-                            + b * (0.85 + 0.8 * tone) * v.pitch
-                            + texture * v.noise * snappy * (2.5 + 3. * snappy)
-                    }
-                    3..=5 => {
-                        let p = 1. + v.pitch;
-                        let x = wave(v, 0, p) * v.body;
-                        let tail = if id == 3 && !v.variant {
-                            v.low * v.noise * 0.15
-                        } else {
-                            0.
-                        };
-                        x + tail
-                    }
-                    6 => {
-                        let a = wave(v, 0, 1.);
-                        if v.variant {
-                            a * v.body
-                        } else {
-                            let b = wave(v, 1, 1.);
-                            (a * 0.55 + b * 0.45) * v.body
-                        }
-                    }
-                    7 => {
-                        if v.variant {
-                            air * v.noise
-                        } else {
-                            let burst = if t < 0.010
-                                || (t >= 0.014 && t < 0.024)
-                                || (t >= 0.028 && t < 0.038)
-                            {
-                                1.
-                            } else {
-                                0.
-                            };
-                            v.band.process(bright) * (burst * 0.8 + v.noise * 0.35)
-                        }
-                    }
-                    8 => {
-                        let a = wave(v, 0, 1.).max(0.);
-                        let b = wave(v, 1, 1.).max(0.);
-                        v.band.process(a * 0.6 + b * 0.8) * v.body * (0.25 + 0.75 * v.noise)
-                    }
-                    9 => texture * (0.4 * v.body + 0.6 * v.noise),
-                    10 => texture * v.body,
-                    11 => (hi * 0.35 + sizzle * 0.6) * v.body + air * v.noise * 0.25,
-                    _ => 0.,
                 }
-            } else {
-                match id {
-                    1 => {
-                        let p = 1. + v.pitch;
-                        let body = wave(v, 0, p) * v.body;
-                        body + bright * v.noise * d.attack.clamp(0., 1.) * 0.45
-                    }
-                    2 => {
-                        let p = 1. + v.pitch;
-                        let a = wave(v, 0, p);
-                        let b = wave(v, 1, p);
-                        let snappy = d.snappy.clamp(0., 1.);
-                        let body = (a + 0.8 * (a * a - 0.5)) * 0.5 * v.body
-                            + (b + 0.5 * (b * b - 0.5)) * 0.85 * v.env;
-                        body * (1. + 1.2 * d.tone.clamp(0., 1.))
-                            + texture * v.noise * snappy * (2.2 - 0.4 * snappy)
-                    }
-                    3..=5 => {
-                        let p = 1. + v.pitch;
-                        (wave(v, 0, p) * 0.85 + wave(v, 1, 1.) * 0.2) * v.body
-                            + bright * v.noise * 0.18
-                    }
-                    6 => {
-                        let a = wave(v, 0, 1.);
-                        let b = wave(v, 1, 1.);
-                        let c = wave(v, 2, 1.);
-                        a * 0.43 * v.body + b * 0.39 * v.noise + c * v.pitch
-                    }
-                    7 => {
-                        let burst = if t < 0.008 {
-                            0.4
-                        } else if (0.014..0.022).contains(&t) {
-                            0.65
-                        } else if (0.030..0.045).contains(&t) {
-                            1.0
-                        } else {
-                            0.
-                        };
-                        texture * (burst + v.noise * 0.35 + v.body * 0.1)
-                    }
-                    8..=11 => {
-                        let mut modal = 0.;
-                        for mode in &mut v.modes {
-                            mode.phase = (mode.phase + mode.step).fract();
-                            modal += (TAU * mode.phase).sin() * mode.amp;
-                            mode.amp *= mode.fall;
-                        }
-                        if id == 11 {
-                            modal * 0.65 + texture * (v.body * 0.3 + v.noise * 0.15)
-                        } else {
-                            modal * 0.65
-                                + bright
-                                    * v.noise
-                                    * if id < 10 {
-                                        0.8
-                                    } else if id == 10 {
-                                        0.6
-                                    } else {
-                                        0.24
-                                    }
-                        }
-                    }
-                    _ => 0.,
+            } else if v.colored {
+                let signal = if v.source_step > 0. {
+                    pitched_color(v, self.kit, id)
+                } else {
+                    colored_signal(v, t, self.kit, id)
+                } * v.env;
+                if self.kit == 0 && id == 9 {
+                    v.tone_state = signal + (1. - v.noise_cut) * v.tone_state;
+                    v.tone_state
+                } else {
+                    signal
                 }
-            };
-            // Calibrated voice balance applies to synthesis, never to the reference recordings.
-            let balance = if self.kit == 0 {
-                [
-                    1., 1.55, 2.12, 1.55, 1.11, 1.56, 1.14, 1.44, 1.8, 0.775, 0.864, 1.05,
-                ][id]
+            } else if id == 1 {
+                kick_sample(v, sr)
+            } else if self.kit == 0 && id == 8 {
+                if t >= v.mode_end {
+                    v.env = 0.;
+                    v.body = 0.;
+                    v.noise = 0.;
+                }
+                let a = pulse(&mut v.phase[0], v.freq[0] / sr, 0.1);
+                let b = pulse(&mut v.phase[1], v.freq[1] / sr, 0.5);
+                v.band.process(1.02 * a + 0.8 * b) * (v.body + v.noise)
             } else {
-                [
-                    1., 0.668, 1.96, 1.79, 1.38, 1.73, 2.5, 6.83, 2.32, 3.02, 2.04, 3.02,
-                ][id]
+                0.
             };
-            out += sound * v.velocity * d.level.clamp(0., 1.5) * 0.19 * balance;
-            v.env *= v.fall;
-            v.body *= v.body_fall;
-            v.noise *= v.noise_fall;
-            v.pitch *= v.pitch_fall;
-            v.age = v.age.saturating_add(1);
+            out += sound * v.velocity * voice_gain(self.kit, id, d.level);
+            advance(v);
         }
-        self.closed_now = false;
+        if let Some(v) = &mut self.kick_tail {
+            if v.env > 1e-6 {
+                out +=
+                    kick_sample(v, sr) * v.velocity * voice_gain(self.kit, 1, kit.voices[1].level);
+                advance(v);
+            }
+        }
         out
     }
 }
-// time to one tenth peak, as used in the 808 service notes.
-fn decay(seconds: f32, sr: f32) -> f32 {
-    (-std::f32::consts::LN_10 / (seconds.max(0.001) * sr)).exp()
+fn advance(v: &mut Voice) {
+    if v.age >= v.hold {
+        v.env *= v.fall;
+        v.noise *= v.noise_fall;
+    }
+    v.body *= v.body_fall;
+    v.pitch *= v.pitch_fall;
+    v.age = v.age.saturating_add(1);
+}
+fn kick_sample(v: &mut Voice, sr: f32) -> f32 {
+    let t = v.age as f32 / sr;
+    if t >= v.mode_end {
+        v.env = 0.;
+        v.body = 0.;
+        v.noise = 0.;
+        v.tone_state = 0.;
+        return 0.;
+    }
+    let mut wave = 0.;
+    for i in 0..3 {
+        wave += (TAU * ((i + 1) as f32 * v.phase[0] + v.modes[i].phase)).sin() * v.modes[i].amp;
+    }
+    v.phase[0] = (v.phase[0] + v.freq[0] + v.freq[1] * v.pitch + v.freq[2] * v.noise).fract();
+    v.body = (-v.freq[3] * t - v.freq[4] * t * t).exp();
+    wave *= v.body;
+    for i in 0..2 {
+        wave += v.mode_pulse[i];
+        v.mode_pulse[i] *= v.mode_pulse_fall[i];
+    }
+    v.tone_state += v.freq[5] * (wave * v.env - v.tone_state);
+    v.tone_state
+}
+fn voice_gain(kit: usize, id: usize, level: f32) -> f32 {
+    // Preserve the reference bus excitation before the rack's existing 2.18 normalization.
+    let mut level = level.clamp(0., 1.5);
+    if kit == 0 && (id == 10 || id == 11) {
+        let raw = (level * 127.).round();
+        level = if id == 10 {
+            (raw / 2.).floor() / 127.
+        } else {
+            (2. * raw / 3.).floor() / 127.
+        };
+    }
+    let coefficient = if kit == 0 {
+        [
+            0., 0.635, 3.175, 1., 1., 1., 0.635, 0.635, 0.635, 0.635, 0.635, 0.635,
+        ][id]
+    } else {
+        [
+            0., 1., 1., 1.1999976, 1.0999978, 1.3999972, 1.0999978, 2.2999954, 0.7999984,
+            1.0999978, 0.5999988, 0.5999988,
+        ][id]
+    };
+    level * level * coefficient / 2.18
 }
 fn lp(hz: f32, sr: f32) -> f32 {
     1. - (-TAU * hz.min(sr * 0.45) / sr).exp()
 }
-fn square(phase: &mut f32, dt: f32) -> f32 {
+fn tone_alpha(tone: f32, sr: f32) -> f32 {
+    let index = ((tone.clamp(0., 1.) * 8.) as usize).min(7);
+    let pole = [0.9939_f32, 0.9757, 0.906, 0.822, 0.675, 0.456, 0.208, 0.001][index];
+    1. - pole.powf(44100. / sr)
+}
+// Generated control curves, not waveform data. A multiplier acts once per sample pair.
+fn drum_decay(value: f32, sr: f32, kit: usize) -> f32 {
+    let index = ((((value - 0.3) / 1.7).clamp(0., 1.) * 16.) as usize).min(15);
+    let pole = if kit == 0 {
+        [
+            0.999_f32, 0.9993, 0.9995, 0.99955, 0.9996089, 0.9996524, 0.9996958, 0.9997393,
+            0.9997828, 0.99982, 0.99986, 0.999913, 0.99993, 0.999956, 0.99997, 1.,
+        ][index]
+    } else {
+        (1. - (15 - index) as f32 * 0.000025).powi(kit as i32)
+    };
+    pole.powf(44100. / (2. * sr))
+}
+fn pulse(phase: &mut f32, dt: f32, duty: f32) -> f32 {
     let dt = dt.clamp(0., 0.45);
     let p = *phase;
     *phase = (p + dt).fract();
-    let mut y = if p < 0.5 { 1. } else { -1. };
+    let mut y = if p < duty { 1. } else { -1. };
     y += blep(p, dt);
-    y -= blep((p + 0.5).fract(), dt);
+    y -= blep((p + 1. - duty).fract(), dt);
     y
 }
 fn blep(t: f32, dt: f32) -> f32 {
@@ -641,28 +659,94 @@ mod tests {
                 d.sample(&kit);
             }
             d.trigger(ch, 1., &kit);
-            if k == 1 {
-                assert!(d.voices[oh].body == 0.);
-            }
+            assert!(d.voices[oh].body > 0. && d.voices[oh].hold == 0);
+            let short_fall = d.voices[oh].fall;
             d.trigger(oh, 1., &kit);
+            assert!(d.voices[ch].body > 0. && d.voices[oh].body > 0.);
             if k == 0 {
-                assert!(d.voices[oh].body_fall < decay(0.01, 48000.))
+                assert!(d.voices[oh].hold > 0);
             } else {
-                assert!(d.voices[ch].body == 0. && d.voices[oh].body > 0.)
+                assert!(d.voices[oh].fall > short_fall);
             }
         }
     }
     #[test]
-    fn tuning_and_decay_anchors() {
+    fn tuning_anchors() {
         let kit = Song::default().drums[0].clone();
         let mut d = DrumSynth::new(48000., 0);
         d.trigger(2, 1., &kit);
-        assert_eq!(d.voices[2].freq[0], 178.);
-        assert_eq!(d.voices[2].freq[1], 332.);
-        assert!((d.voices[2].body_fall.powf(48000. * 0.067) - 0.1).abs() < 0.001);
+        assert!((d.voices[2].modes[0].step * 48000. - 178.).abs() < 2.);
+        assert!((d.voices[2].modes[1].step * 48000. - 332.).abs() < 3.);
         d.trigger(8, 1., &kit);
-        assert_eq!(d.voices[8].freq[0], 536.);
-        assert_eq!(d.voices[8].freq[1], 808.);
+        assert_eq!(d.voices[8].freq[0], 537.279);
+        assert_eq!(d.voices[8].freq[1], 809.69);
+    }
+    #[test]
+    fn kick_tuning_changes_sweep_and_preserves_final_pitch() {
+        let mut kit = Song::default().drums[1].clone();
+        let mut starts = Vec::new();
+        for tune in [-6., -2., 2., 6.] {
+            kit.voices[1].tune = tune;
+            let mut d = DrumSynth::new(44100., 1);
+            d.trigger(1, 1., &kit);
+            starts.push(d.voices[1].pitch_fall);
+            for _ in 0..22050 {
+                d.sample(&kit);
+            }
+            let v = &d.voices[1];
+            let frequency = (v.freq[0] + v.freq[1] * v.pitch + v.freq[2] * v.noise) * 44100.;
+            assert!((53. ..55.).contains(&frequency), "Tune {tune}: {frequency}");
+        }
+        assert!(starts.windows(2).all(|p| p[1] > p[0]));
+    }
+    #[test]
+    fn kick_retrigger_retains_fading_tail_and_clear_silences_it() {
+        for k in 0..2 {
+            let kit = Song::default().drums[k].clone();
+            let mut d = DrumSynth::new(44100., k);
+            d.trigger(1, 1., &kit);
+            for _ in 0..4410 {
+                d.sample(&kit);
+            }
+            let age = d.voices[1].age;
+            d.trigger(1, 1., &kit);
+            let tail = d.kick_tail.as_ref().unwrap();
+            assert_eq!(tail.age, age);
+            assert!(tail.env > 0. && tail.fall < d.voices[1].fall);
+            assert!(d.sample(&kit).is_finite());
+            d.clear();
+            assert!(d.kick_tail.is_none());
+            assert!((0..128).all(|_| d.sample(&kit) == 0.));
+        }
+    }
+    #[test]
+    fn selectors_and_control_extremes_are_finite_and_end() {
+        for sr in [8000., 44100., 96000.] {
+            for k in 0..2 {
+                let mut kit = Song::default().drums[k].clone();
+                for id in 1..12 {
+                    for high in [false, true] {
+                        let v = &mut kit.voices[id];
+                        v.variant = high;
+                        v.tune = if high { 6. } else { -6. };
+                        v.tone = if high { 1. } else { 0. };
+                        v.decay = if high { 2. } else { 0.3 };
+                        let mut d = DrumSynth::new(sr, k);
+                        d.trigger(id, 1., &kit);
+                        assert!(
+                            (0..(sr * 0.12) as usize).all(|_| d.sample(&kit).is_finite()),
+                            "{sr}:{k}:{id}:{high}"
+                        );
+                        if k == 0 && id == 8 {
+                            for _ in 0..(sr * 1.1) as usize {
+                                d.sample(&kit);
+                            }
+                            assert_eq!(d.voices[id].env, 0.);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 #[cfg(test)]

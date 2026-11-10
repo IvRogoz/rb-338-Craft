@@ -1,20 +1,31 @@
 # Third-party notices
 
 The app synthesizes audio at runtime and redraws its interface. The runtime uses
-no original ReBirth recordings, sample banks, image assets, or sprites.
+no original ReBirth recordings, sample banks, waveform ROM, image assets, or
+sprites. Original local audio resources were analyzed offline only; procedural
+parameters define the runtime oscillators, noise, and filter envelopes.
 
 ## Current software and dependency credits
 
 The native interface uses eframe/egui and bundled fallback fonts. Their credits
 are listed in [native/THIRD_PARTY_NOTICES.md](native/THIRD_PARTY_NOTICES.md).
 
-## Current synthesis references
+## Current synthesis and offline evaluation
 
-The frequency-compensated filter coefficients and resonance control mapping in
-`crates/engine/src/acid.rs` adapt Open303's design. These adaptations are also
-present in the native engine at `native/crates/engine/src/acid.rs`.
-The fixed accented filter-envelope decay follows Open303's documented stock
-303 behavior. This is not a port of its entire engine.
+The acid synthesis uses an analytic oscillator, a pre-filter, a resonant filter
+pair, and a DC blocker. Drum synthesis uses colored noise and damped-mode
+profiles.
+
+Source investigations, test fixtures, and reference comparisons used
+[pingw33n/OpenRB-338](https://github.com/pingw33n/openrb-338/tree/main), pinned to
+`cbca4492c0224dffaa477346bc8860559f3d853f`. Its study source is licensed under
+GPL-3.0.
+
+## Historical Open303 research
+
+The previous engine adapted Open303's frequency-compensated filter coefficients
+and resonance control mapping. Its fixed accented filter-envelope decay followed
+Open303's documented stock 303 behavior. It was not a port of the entire engine.
 
 Source: https://github.com/midilab/jc303/tree/main/src/dsp/open303
 
@@ -40,14 +51,14 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
-## 808 cymbal research
+## Historical 808 cymbal research
 
-The synthesized 808 cymbal uses published oscillator frequencies and filtering
+The previous engine's synthesized 808 cymbal used published oscillator frequencies and filtering
 measurements from Kurt James Werner, Jonathan S.
 Abel and Julius O. Smith III, *The TR-808 Cymbal: a Physically-Informed,
 Circuit-Bendable, Digital Model* (2014), distributed under Creative Commons
-Attribution 3.0. The Rust implementation generates oscillators and noise with
-digital filters; it does not implement the paper's electrical component network.
+Attribution 3.0. That implementation generated oscillators and noise with
+digital filters; it did not implement the paper's electrical component network.
 
 Paper: https://www.icmc14-smc14.net/images/proceedings/OS24-B10-TheTR-808Cymbal.pdf
 
