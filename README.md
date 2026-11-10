@@ -153,17 +153,24 @@ Tests cover import validation, patterns and transport, arrangements and automati
 
 ## Sound fidelity and credits
 
-This is a Rust reimplementation, not the original ReBirth audio engine. Current source changes calibrate synthesized bass envelopes, cutoff and square-wave balance, and percussion resonances, noise and voice gains. Inserts now precede faders; mixer and effect controls use corrected curves, including logarithmic drive and PCF cutoff, stepped PCF decay, frequency-dependent PCF resonance and gain, and compressor automatic level gain. RBS import corrects loop, shuffle, Vintage, delay, 808 voice selectors and PCF destination IDs while preserving internal automation encoding. The 909 metallic voices are synthesized replacements for the original sample-based sounds. Runtime synthesis uses digital oscillators, envelopes, noise and filters rather than electrical component-network simulation; it has no recordings, sample banks or waveform ROMs. Reference recordings are used only for offline evaluation.
+This is a Rust reimplementation, not the original ReBirth audio engine. The current timbre changes affect the synthesis code in both engine copies: 303 resonance feedback, output high-pass and asymmetric square wave; independently decaying snare and rimshot resonances; snare body/noise balance; and metallic percussion filtering, harmonics and tails. The 808 snare Tone control now blends fixed resonances instead of transposing the drum, and both interfaces label it TONE. The WAV-export wrapper is unchanged; it renders the changed engine. Runtime synthesis uses digital oscillators, envelopes, noise and filters rather than electrical component-network simulation; it has no recordings, sample banks or waveform ROMs. Reference recordings are used only for offline evaluation.
 
-On 2026-11-10, 38 engine, 20 model and 3 WAV-export tests passed. All 145 diagnostic cases and 11 original-application references were compared as stereo 44.1 kHz, 16-bit PCM, using [OpenRB-338 reference revision cbca4492c0224dffaa477346bc8860559f3d853f](https://github.com/pingw33n/openrb-338/tree/cbca4492c0224dffaa477346bc8860559f3d853f). Normalized spectral distance improved in 105 of 142 non-silent diagnostic cases and regressed in 37. This is not a perceptual score; calibration and evaluation used the same corpus, and the exact comparator matched silence only. Some compressor, PCF and full-mix spectral comparisons became worse, so exact or universally improved timbre is not established.
+On 2026-11-10, 42 engine, 20 model and 3 WAV-export tests passed. All 145 diagnostic cases and 11 original-application references were rendered and compared as stereo 44.1 kHz, 16-bit PCM, using [OpenRB-338 reference revision cbca4492c0224dffaa477346bc8860559f3d853f](https://github.com/pingw33n/openrb-338/tree/cbca4492c0224dffaa477346bc8860559f3d853f). A focused comparison of all 77 core instrument cases, including knob extremes, removes overall level from spectral and envelope measurements. The baseline below is commit `a24dd64`, before this timbre pass. Lower errors are better; these are not percentages of audible similarity.
 
-| Group | Median absolute level error before | After |
-| --- | ---: | ---: |
-| 303 | 2.40 dB | 1.44 dB |
-| 808 | 4.33 dB | 0.26 dB |
-| 909 | 6.75 dB | 0.67 dB |
-| Full mix | 3.06 dB | 0.80 dB |
+| Instrument group | Cases | Median band-balance error before → current | Median envelope error before → current |
+| --- | ---: | ---: | ---: |
+| 303 | 24 | 0.274 → 0.082 | 0.055 → 0.063 |
+| 808 | 25 | 0.169 → 0.059 | 0.074 → 0.049 |
+| 909 | 28 | 0.241 → 0.197 | 0.116 → 0.101 |
+
+Band error is half the absolute difference between normalized powers in nine bands from 20 Hz to 20 kHz. Envelope error compares unit-peak RMS shapes, smoothed over 10 ms for drums and 30 ms for bass. Both use the first hit/note, ending at the next programmed step or 250 ms. Band error improved in 47 cases, regressed in 8 and stayed effectively unchanged in 22. The measurement includes attack energy, but coarse bands and smoothed envelopes miss fine timbral details and later slides. Calibration and evaluation used the same corpus. Strong 303 resonance, 909 kick extremes, flams and some envelopes still differ substantially; the full-corpus compressor spectral comparison also regressed. The exact comparator matched silence only.
+
+The local comparison artifacts under `target/verification/openrb-comparison/timbre/` include per-case measurements, the previous source/output snapshot and a detailed report. `target/verification/openrb-comparison/timbre-matched-level-ABC.zip` contains 77 listening comparisons: original reference, commit `a24dd64`, then current synthesis, with equal RMS and clipping-safe common gain applied only to listening copies. Original WAV renders are preserved separately. Earlier RBS import, mixer and effect-routing corrections remain in place.
 
 These results describe the source changes; the browser distribution and packaged native build were not rebuilt. Hardware playback and subjective listening were not verified.
 
 Synthesis references, source credits, and retained license notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The original interface artwork described there is retained only as local reference material; the web interface uses HTML/CSS and the native version draws its interface in Rust.
+
+## Contributors
+
+- **Codex** — AI-assisted development, testing, and sound-engine improvements.

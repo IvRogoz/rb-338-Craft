@@ -212,7 +212,7 @@ fn drum_panel(a: &App, k: usize) -> String {
                 ],
                 2 => &[
                     ("LEVEL", "level", d.level, 0., 1., 0.01),
-                    ("TUNE", "tune", d.tune, -6., 6., 0.1),
+                    ("TONE", "tune", d.tune, -6., 6., 0.1),
                     ("SNAPPY", "snappy", d.snappy, 0., 1., 0.01),
                 ],
                 3..=5 => &[

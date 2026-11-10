@@ -318,7 +318,7 @@ fn fields(k: usize, i: usize) -> &'static [Field] {
     if k == 0 {
         match i {
             1 | 9 => &[LEVEL, TONE, DECAY],
-            2 => &[LEVEL, TUNE, SNAPPY],
+            2 => &[LEVEL, ("TONE", "tune", -6., 6.), SNAPPY],
             3..=5 => &[LEVEL, TUNE],
             10 => &[LEVEL, DECAY],
             _ => &[LEVEL],

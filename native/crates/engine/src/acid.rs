@@ -48,6 +48,9 @@ pub struct AcidVoice {
     feedback_low: f32,
     decimate: [f32; 3],
     last: f32,
+    dc_input: f32,
+    dc: f32,
+    dc_decay: f32,
 }
 impl AcidVoice {
     pub fn new(sr: f32) -> Self {
@@ -84,6 +87,9 @@ impl AcidVoice {
             feedback_low: 0.0,
             decimate: [0.0; 3],
             last: 0.0,
+            dc_input: 0.0,
+            dc: 0.0,
+            dc_decay: (-2.0 * PI * 100.0 / osr).exp(),
         }
     }
     pub fn clear(&mut self) {
@@ -162,6 +168,8 @@ impl AcidVoice {
             self.feedback_low = 0.0;
             self.decimate = [0.0; 3];
             self.last = 0.0;
+            self.dc = 0.0;
+            self.dc_input = 0.0;
             return 0.0;
         }
         let key = [
@@ -174,7 +182,8 @@ impl AcidVoice {
             self.coeff_key = key;
             self.coeff_count = if self.vintage { 4 } else { 16 };
             let modulation = (cfg.envelope / 2400.0).clamp(0.0, 5.0);
-            let cutoff = (cfg.cutoff * (0.25 + 0.75 * cfg.resonance.clamp(0.0, 1.0))
+            let cutoff = (cfg.cutoff
+                * (0.25 + 0.25 * cfg.resonance.clamp(0.0, 1.0))
                 * 2.0_f32.powf(
                     env * modulation
                         * (1.0
@@ -195,8 +204,7 @@ impl AcidVoice {
             let a0 = -(-wc).exp();
             let a = resonance * a_full + (1.0 - resonance) * a0;
             let g = (1.0 + a).clamp(0.0, 0.99);
-            let gsq = g * g / (1.0 + a * a + 2.0 * a * cs).max(1e-9);
-            let feedback = (resonance / (gsq * gsq).max(1e-9)).min(3.9);
+            let feedback = 3.98 * r;
             self.g_step = (g - self.g) / self.coeff_count as f32;
             self.feedback_step = (feedback - self.feedback) / self.coeff_count as f32;
         }
@@ -210,8 +218,10 @@ impl AcidVoice {
             let saw = 2.0 * self.phase - 1.0 - blep(self.phase, dt);
             let wave = match cfg.wave.as_str() {
                 "square" => {
-                    let square = if self.phase < 0.5 { 1.0 } else { -1.0 };
-                    (square + blep(self.phase, dt) - blep((self.phase + 0.5).fract(), dt)) * 0.55
+                    let duty = 0.523;
+                    let square = if self.phase < duty { 1.0 } else { -1.0 };
+                    (square + blep(self.phase, dt) - blep((self.phase + 1.0 - duty).fract(), dt))
+                        * 0.55
                 }
                 "sine" => (2.0 * PI * self.phase).sin(),
                 "triangle" => 1.0 - 4.0 * (self.phase - 0.5).abs(),
@@ -226,6 +236,9 @@ impl AcidVoice {
                 x = *stage;
             }
             x = self.stages[3];
+            self.dc = x - self.dc_input + self.dc_decay * self.dc;
+            self.dc_input = x;
+            x = self.dc;
             for stage in &mut self.decimate {
                 *stage += aa * (x - *stage);
                 x = *stage;
@@ -321,6 +334,34 @@ mod tests {
         let x: Vec<_> = (0..4096).map(|_| a.sample(&c)).collect();
         let y: Vec<_> = (0..4096).map(|_| b.sample(&d)).collect();
         assert_ne!(x, y);
+    }
+    #[test]
+    fn square_retains_even_harmonics() {
+        let mut c = rb_model::Song::default().synth[0].clone();
+        c.wave = "square".into();
+        c.cutoff = 20000.;
+        c.resonance = 0.;
+        c.envelope = 0.;
+        let mut v = AcidVoice::new(48000.);
+        v.note(&note(69, true, false, true), &c, 1., false);
+        for _ in 0..4800 {
+            v.sample(&c);
+        }
+        let x: Vec<_> = (0..4800).map(|_| v.sample(&c)).collect();
+        let magnitude = |hz: f32| {
+            let (mut re, mut im) = (0., 0.);
+            for (i, sample) in x.iter().enumerate() {
+                let phase = 2. * PI * hz * i as f32 / 48000.;
+                re += sample * phase.cos();
+                im += sample * phase.sin();
+            }
+            (re * re + im * im).sqrt()
+        };
+        let ratio = magnitude(880.) / magnitude(440.);
+        assert!(
+            (0.05..0.2).contains(&ratio),
+            "second harmonic ratio {ratio}"
+        );
     }
     #[test]
     fn output_pitch_and_resonant_spectrum() {
@@ -424,7 +465,10 @@ mod tests {
         let mut vintage = AcidVoice::new(48000.);
         modern.note(&note(48, true, false, false), &c, 0.1, false);
         vintage.note(&note(48, true, false, false), &c, 0.1, true);
-        for _ in 0..3600 { modern.sample(&c); vintage.sample(&c); }
+        for _ in 0..3600 {
+            modern.sample(&c);
+            vintage.sample(&c);
+        }
         assert!(modern.amp > vintage.amp * 10.0);
         assert!((modern.filter_env - vintage.filter_env).abs() < 1e-6);
     }
