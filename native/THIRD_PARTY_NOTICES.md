@@ -1,6 +1,9 @@
 # Third-party notices
 
-## Native interface and fallback fonts
+The app synthesizes audio at runtime and redraws its interface. The runtime uses
+no original ReBirth recordings, sample banks, image assets, or sprites.
+
+## Current software, native interface, and fallback fonts
 
 The native interface uses eframe/egui 0.33.3. The upstream MIT notice is retained
 in [licenses/egui-LICENSE-MIT.txt](licenses/egui-LICENSE-MIT.txt).
@@ -11,20 +14,10 @@ Bundled fallback font notices supplied with epaint_default_fonts 0.33.3 are in
 Windows Arial fonts are loaded from the operating system when available and are
 not included in this distribution.
 
-## Original interface graphics
+## Current synthesis references
 
-Original ReBirth RB-338 Standard Components artwork by Propellerhead Software
-was extracted statically from the archived ModPacker distribution for local
-visual reference. The native runtime paints its interface in Rust and does not
-use or ship these images. No installer or original application is executed.
-The artwork is separate from the Rust source and is not relicensed under the
-open-source licenses below. No original audio assets are included.
-
-Source: https://archive.org/download/re-birth-rb-338-data/ReBirth%20RB-338/Install%20ReBirth%20ModPacker.exe
-
-## Rust synthesis references
-
-The resonance control mapping in `crates/engine/src/acid.rs` adapts Open303's mapping.
+The frequency-compensated filter coefficients and resonance control mapping in
+`crates/engine/src/acid.rs` adapt Open303's design.
 The fixed accented filter-envelope decay follows Open303's documented stock
 303 behavior. This is not a port of its entire engine.
 
@@ -52,6 +45,8 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
+## 808 cymbal research
+
 The synthesized 808 cymbal uses published oscillator frequencies and filtering
 measurements from Kurt James Werner, Jonathan S.
 Abel and Julius O. Smith III, *The TR-808 Cymbal: a Physically-Informed,
@@ -62,6 +57,19 @@ digital filters; it does not implement the paper's electrical component network.
 Paper: https://www.icmc14-smc14.net/images/proceedings/OS24-B10-TheTR-808Cymbal.pdf
 
 License: https://creativecommons.org/licenses/by/3.0/
+
+## Reference-only original interface graphics
+
+Original ReBirth RB-338 Standard Components artwork by Propellerhead Software
+was extracted statically from the archived ModPacker distribution for local
+visual reference. The native runtime paints its interface in Rust and does not
+use these images. No installer or original application is executed.
+The artwork is separate from the Rust source and is not relicensed under the
+implementation's open-source licenses. No original audio assets are included.
+
+Source: https://archive.org/download/re-birth-rb-338-data/ReBirth%20RB-338/Install%20ReBirth%20ModPacker.exe
+
+## Historical retired JavaScript solver
 
 Historical notice: the retired JavaScript implementation's zero-delay coupled
 diode ladder in `web/analog.js` adapted the topology and
