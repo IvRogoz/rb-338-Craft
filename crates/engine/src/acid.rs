@@ -112,6 +112,8 @@ impl AcidVoice {
         }
         self.accented = n.accent;
         self.vintage = vintage;
+        self.attack = 1.0 - (-1.0 / (if vintage { 0.00086 } else { 0.0005 } * self.sr)).exp();
+        self.release = 1.0 - (-1.0 / (if vintage { 0.00086 } else { 0.0223 } * self.sr)).exp();
         self.coeff_count = 0;
         self.pending_slide = n.slide;
         self.gate_samples = if n.slide {
@@ -142,11 +144,11 @@ impl AcidVoice {
         if self.gate_samples.is_finite() && self.gate_samples > 0.0 {
             self.gate_samples -= 1.0;
         }
-        // The vintage shortening ratio is a design choice, not a measurement.
+        // Vintage changes the original control rate, not the envelope time constant.
         let decay = if self.accented {
             0.2
         } else {
-            cfg.decay.max(0.01) * if self.vintage { 0.5 } else { 1.0 }
+            cfg.decay.max(0.01)
         };
         if decay != self.decay_setting {
             self.decay_factor = (-1.0 / (decay * sr)).exp();
@@ -170,9 +172,9 @@ impl AcidVoice {
         ];
         if self.coeff_count == 0 || key != self.coeff_key {
             self.coeff_key = key;
-            self.coeff_count = 16;
+            self.coeff_count = if self.vintage { 4 } else { 16 };
             let modulation = (cfg.envelope / 2400.0).clamp(0.0, 5.0);
-            let cutoff = (cfg.cutoff
+            let cutoff = (cfg.cutoff * (0.25 + 0.75 * cfg.resonance.clamp(0.0, 1.0))
                 * 2.0_f32.powf(
                     env * modulation
                         * (1.0
@@ -195,8 +197,8 @@ impl AcidVoice {
             let g = (1.0 + a).clamp(0.0, 0.99);
             let gsq = g * g / (1.0 + a * a + 2.0 * a * cs).max(1e-9);
             let feedback = (resonance / (gsq * gsq).max(1e-9)).min(3.9);
-            self.g_step = (g - self.g) / 16.0;
-            self.feedback_step = (feedback - self.feedback) / 16.0;
+            self.g_step = (g - self.g) / self.coeff_count as f32;
+            self.feedback_step = (feedback - self.feedback) / self.coeff_count as f32;
         }
         self.coeff_count -= 1;
         self.g += self.g_step;
@@ -209,7 +211,7 @@ impl AcidVoice {
             let wave = match cfg.wave.as_str() {
                 "square" => {
                     let square = if self.phase < 0.5 { 1.0 } else { -1.0 };
-                    (square + blep(self.phase, dt) - blep((self.phase + 0.5).fract(), dt)) * 0.8
+                    (square + blep(self.phase, dt) - blep((self.phase + 0.5).fract(), dt)) * 0.55
                 }
                 "sine" => (2.0 * PI * self.phase).sin(),
                 "triangle" => 1.0 - 4.0 * (self.phase - 0.5).abs(),
@@ -407,13 +409,24 @@ mod tests {
         }
         assert!((normal.amp - accent.amp).abs() < 1e-6);
         assert!(accent.filter_env < normal.filter_env);
-        assert!(vintage.filter_env < normal.filter_env);
+        assert!((vintage.filter_env - normal.filter_env).abs() < 1e-6);
         for _ in 0..48000 {
             normal.sample(&c);
             accent.sample(&c);
         }
         assert_eq!(normal.sample(&c), 0.0);
         assert_eq!(accent.sample(&c), 0.0);
+    }
+    #[test]
+    fn vintage_has_fast_release_without_shortening_filter_decay() {
+        let c = rb_model::Song::default().synth[0].clone();
+        let mut modern = AcidVoice::new(48000.);
+        let mut vintage = AcidVoice::new(48000.);
+        modern.note(&note(48, true, false, false), &c, 0.1, false);
+        vintage.note(&note(48, true, false, false), &c, 0.1, true);
+        for _ in 0..3600 { modern.sample(&c); vintage.sample(&c); }
+        assert!(modern.amp > vintage.amp * 10.0);
+        assert!((modern.filter_env - vintage.filter_env).abs() < 1e-6);
     }
     #[test]
     fn release_render_cost() {

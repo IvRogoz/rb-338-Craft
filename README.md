@@ -153,6 +153,17 @@ Tests cover import validation, patterns and transport, arrangements and automati
 
 ## Sound fidelity and credits
 
-This is a Rust reimplementation, not the original ReBirth audio engine. Exact ReBirth timbre matching has not been established. The 909 metallic voices are synthesized replacements for the original sample-based sounds. The runtime uses digital oscillators, envelopes, noise, and filters rather than electrical component-network simulation.
+This is a Rust reimplementation, not the original ReBirth audio engine. Current source changes calibrate synthesized bass envelopes, cutoff and square-wave balance, and percussion resonances, noise and voice gains. Inserts now precede faders; mixer and effect controls use corrected curves, including logarithmic drive and PCF cutoff, stepped PCF decay, frequency-dependent PCF resonance and gain, and compressor automatic level gain. RBS import corrects loop, shuffle, Vintage, delay, 808 voice selectors and PCF destination IDs while preserving internal automation encoding. The 909 metallic voices are synthesized replacements for the original sample-based sounds. Runtime synthesis uses digital oscillators, envelopes, noise and filters rather than electrical component-network simulation; it has no recordings, sample banks or waveform ROMs. Reference recordings are used only for offline evaluation.
+
+On 2026-11-10, 38 engine, 20 model and 3 WAV-export tests passed. All 145 diagnostic cases and 11 original-application references were compared as stereo 44.1 kHz, 16-bit PCM, using [OpenRB-338 reference revision cbca4492c0224dffaa477346bc8860559f3d853f](https://github.com/pingw33n/openrb-338/tree/cbca4492c0224dffaa477346bc8860559f3d853f). Normalized spectral distance improved in 105 of 142 non-silent diagnostic cases and regressed in 37. This is not a perceptual score; calibration and evaluation used the same corpus, and the exact comparator matched silence only. Some compressor, PCF and full-mix spectral comparisons became worse, so exact or universally improved timbre is not established.
+
+| Group | Median absolute level error before | After |
+| --- | ---: | ---: |
+| 303 | 2.40 dB | 1.44 dB |
+| 808 | 4.33 dB | 0.26 dB |
+| 909 | 6.75 dB | 0.67 dB |
+| Full mix | 3.06 dB | 0.80 dB |
+
+These results describe the source changes; the browser distribution and packaged native build were not rebuilt. Hardware playback and subjective listening were not verified.
 
 Synthesis references, source credits, and retained license notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The original interface artwork described there is retained only as local reference material; the web interface uses HTML/CSS and the native version draws its interface in Rust.

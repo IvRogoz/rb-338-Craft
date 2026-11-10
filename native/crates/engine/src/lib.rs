@@ -57,6 +57,8 @@ impl Engine {
             48000.
         };
         let song = Song::default();
+        let mut rack = fx::Rack::new(sr);
+        rack.configure(&song);
         Self {
             current: song.clone(),
             active_slots: song.slots,
@@ -83,7 +85,7 @@ impl Engine {
             drums: std::array::from_fn(|k| DrumSynth::new(sr, k)),
             flams: [[[0.; 16]; 12]; 2],
             flam_gain: [[[0.; 16]; 12]; 2],
-            rack: fx::Rack::new(sr),
+            rack,
             metronome: false,
             click: 0.,
             click_phase: 0.,

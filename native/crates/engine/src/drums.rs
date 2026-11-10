@@ -173,7 +173,7 @@ impl DrumSynth {
             match id {
                 1 => {
                     v.phase[0] = old.phase[0];
-                    v.freq[0] = 56.;
+                    v.freq[0] = 51.5;
                     v.body = (old.body * 0.35 + 1.).min(1.5);
                     v.body_fall = decay(0.05 + (d.decay.clamp(0.3, 2.) - 0.3) / 1.7 * 0.75, sr);
                     v.pitch = 1.;
@@ -182,7 +182,7 @@ impl DrumSynth {
                     v.fall = decay(0.8, sr);
                 }
                 2 => {
-                    v.freq = [238. * tune, 476. * tune, 0., 0., 0., 0.];
+                    v.freq = [178. * tune, 332. * tune, 0., 0., 0., 0.];
                     v.body_fall = decay(0.060, sr);
                     v.noise_fall = decay(0.085, sr);
                     v.fall = v.noise_fall;
@@ -190,7 +190,7 @@ impl DrumSynth {
                 3..=5 => {
                     let j = id - 3;
                     let f = if d.variant {
-                        [185., 280., 400.][j]
+                        [183., 269., 381.][j]
                     } else {
                         [90., 135., 185.][j]
                     };
@@ -204,7 +204,7 @@ impl DrumSynth {
                         sr,
                     );
                     v.noise_fall = decay(0.22, sr);
-                    v.pitch = 0.28;
+                    v.pitch = if d.variant { 0.0 } else { 0.28 };
                     v.pitch_fall = decay(0.030, sr);
                     v.fall = v.body_fall;
                 }
@@ -248,8 +248,8 @@ impl DrumSynth {
                     v.fall = v.body_fall;
                 }
                 11 => {
-                    v.body_fall = decay(0.05, sr);
-                    v.noise_fall = decay(0.018, sr);
+                    v.body_fall = decay(0.030, sr);
+                    v.noise_fall = decay(0.012, sr);
                     v.fall = v.body_fall;
                 }
                 _ => {}
@@ -257,7 +257,7 @@ impl DrumSynth {
         } else {
             match id {
                 1 => {
-                    v.freq[0] = 55. * tune;
+                    v.freq[0] = 58. * tune;
                     v.body_fall = decay(0.10 + d.decay.clamp(0.3, 2.) * 0.32, sr);
                     v.pitch = 1.1;
                     v.pitch_fall = decay(0.035, sr);
@@ -274,7 +274,8 @@ impl DrumSynth {
                     v.fall = v.noise_fall;
                 }
                 3..=5 => {
-                    v.freq[0] = [95., 155., 235.][id - 3] * tune;
+                    v.freq[0] = [90., 112., 128.][id - 3] * tune;
+                    v.freq[1] = [60., 76., 96.][id - 3] * tune;
                     v.body_fall = decay(0.05 + d.decay.clamp(0.3, 2.) * 0.12, sr);
                     v.noise_fall = decay(0.022, sr);
                     v.pitch = 0.5;
@@ -282,10 +283,10 @@ impl DrumSynth {
                     v.fall = v.body_fall;
                 }
                 6 => {
-                    v.freq[0] = 520.;
-                    v.freq[1] = 1720.;
-                    v.freq[2] = 2900.;
-                    v.body_fall = decay(0.014, sr);
+                    v.freq[0] = 223.;
+                    v.freq[1] = 480.;
+                    v.freq[2] = 1037.;
+                    v.body_fall = decay(0.028, sr);
                     v.fall = v.body_fall;
                 }
                 7 => {
@@ -299,7 +300,7 @@ impl DrumSynth {
                         10 => 1.4 / tune,
                         _ => 0.9 / tune,
                     };
-                    // Designed spectra: not derived from samples or recordings.
+                    // Inharmonic resonators and filtered noise; no stored audio or waveform tables.
                     for i in 0..32 {
                         let x = i as f32;
                         let base = match id {
@@ -313,7 +314,7 @@ impl DrumSynth {
                         } else {
                             0.5 + ((i * 17 % 11) as f32) / 20.
                         };
-                        let duration = seconds * (0.30 + 0.70 / (1. + x * 0.08));
+                        let duration = seconds * (0.55 + 0.45 / (1. + x * 0.08));
                         v.modes[i] = Mode {
                             phase: (x * 0.137).fract(),
                             step: if freq < sr * 0.46 { freq / sr } else { 0. },
@@ -357,6 +358,8 @@ impl DrumSynth {
             v.low += self.noise_alpha[0] * (noise - v.low);
             v.high += self.noise_alpha[1] * (noise - v.high);
             let bright = v.high - v.low;
+            let air = noise - v.low;
+            let sizzle = noise - v.high;
             let t = v.age as f32 / sr;
             let wave = |v: &mut Voice, i: usize, ratio: f32| {
                 v.phase[i] = (v.phase[i] + v.freq[i] * ratio / sr).fract();
@@ -377,7 +380,7 @@ impl DrumSynth {
                         let a = wave(v, 0, 1.);
                         let b = wave(v, 1, 1.);
                         (a * 0.55 + b * 0.35) * v.body
-                            + bright * v.noise * d.snappy.clamp(0., 1.) * 0.8
+                            + air * v.noise * d.snappy.clamp(0., 1.) * 1.25
                     }
                     3..=5 => {
                         let p = 1. + v.pitch;
@@ -400,7 +403,7 @@ impl DrumSynth {
                     }
                     7 => {
                         if v.variant {
-                            bright * v.noise
+                            air * v.noise
                         } else {
                             let burst = if t < 0.010
                                 || (t >= 0.014 && t < 0.024)
@@ -420,11 +423,11 @@ impl DrumSynth {
                     }
                     9 => {
                         let tone = d.tone.clamp(0., 1.);
-                        (lo * 0.35 + mid * (0.55 - tone * 0.2) + hi * (0.2 + tone * 0.8)) * v.body
-                            + hi * v.noise * 0.4
+                        (lo * 0.15 + hi * (0.45 + tone * 0.35) + air * (0.35 + tone * 0.15)) * v.body
+                            + sizzle * v.noise * 0.4
                     }
-                    10 => (mid * 0.5 + hi) * v.body + hi * v.noise * 0.3,
-                    11 => (mid * 0.35 + hi) * v.body + hi * v.noise * 0.35,
+                    10 => (mid * 0.25 + hi * 0.5 + sizzle * 0.4) * v.body + air * v.noise * 0.25,
+                    11 => (hi * 0.35 + sizzle * 0.6) * v.body + air * v.noise * 0.25,
                     _ => 0.,
                 }
             } else {
@@ -442,7 +445,7 @@ impl DrumSynth {
                     }
                     3..=5 => {
                         let p = 1. + v.pitch;
-                        wave(v, 0, p) * v.body + bright * v.noise * 0.18
+                        (wave(v, 0, p) * 0.85 + wave(v, 1, 1.) * 0.2) * v.body + bright * v.noise * 0.18
                     }
                     6 => {
                         let a = wave(v, 0, 1.);
@@ -482,7 +485,13 @@ impl DrumSynth {
                     _ => 0.,
                 }
             };
-            out += sound * v.velocity * d.level.clamp(0., 1.5) * 0.19;
+            // Calibrated voice balance applies to synthesis, never to the reference recordings.
+            let balance = if self.kit == 0 {
+                [1., 1.55, 2.12, 1.55, 1.11, 1.56, 1.14, 1.44, 1.8, 0.775, 0.864, 1.05][id]
+            } else {
+                [1., 0.668, 1.96, 1.79, 1.38, 1.73, 2.5, 6.83, 2.32, 3.02, 2.04, 3.02][id]
+            };
+            out += sound * v.velocity * d.level.clamp(0., 1.5) * 0.19 * balance;
             v.env *= v.fall;
             v.body *= v.body_fall;
             v.noise *= v.noise_fall;
@@ -580,8 +589,8 @@ mod tests {
         let kit = Song::default().drums[0].clone();
         let mut d = DrumSynth::new(48000., 0);
         d.trigger(2, 1., &kit);
-        assert_eq!(d.voices[2].freq[0], 238.);
-        assert_eq!(d.voices[2].freq[1], 476.);
+        assert_eq!(d.voices[2].freq[0], 178.);
+        assert_eq!(d.voices[2].freq[1], 332.);
         assert!((d.voices[2].body_fall.powf(48000. * 0.06) - 0.1).abs() < 0.001);
         d.trigger(8, 1., &kit);
         assert_eq!(d.voices[8].freq[0], 540.);
@@ -611,8 +620,8 @@ mod render_measurements {
         d.trigger(2, 1., &kit);
         let x: Vec<_> = (0..4800).map(|_| d.sample(&kit)).collect();
         let segment = &x[..2880];
-        assert!(spectral(segment, 238., sr) > spectral(segment, 100., sr) * 3.);
-        assert!(spectral(segment, 476., sr) > spectral(segment, 800., sr) * 3.);
+        assert!(spectral(segment, 178., sr) > spectral(segment, 100., sr) * 3.);
+        assert!(spectral(segment, 332., sr) > spectral(segment, 800., sr) * 3.);
         let ratio = rms(&x[3360..3840]) / rms(&x[480..960]);
         assert!((0.075..0.14).contains(&ratio), "decay ratio {ratio}");
     }

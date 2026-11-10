@@ -5,6 +5,18 @@ fn unit(v: u8) -> f32 {
     (v.min(127) as f32) / 127.0
 }
 
+fn rbs_control_value(track: u8, controller: u8, value: u8) -> u8 {
+    if track == 0 && controller == 2 && value != 0 {
+        value.saturating_add(1)
+    } else if (track == 5 && controller == 2)
+        || (track == 3 && matches!(controller, 11 | 14 | 17 | 19 | 21))
+    {
+        u8::from(value == 0)
+    } else {
+        value
+    }
+}
+
 pub fn apply_automation(song: &mut Song, e: &Automation) {
     let u = unit(e.value);
     let c = e.controller as usize;
@@ -198,6 +210,7 @@ fn parse_chunks(
     track: &mut u8,
     changes: &mut [Vec<(usize, usize)>; 4],
     end_tick: &mut usize,
+    loop_range: &mut Option<(usize, usize)>,
     depth: usize,
 ) -> Result<(), String> {
     if depth > 32 {
@@ -229,6 +242,7 @@ fn parse_chunks(
                     track,
                     changes,
                     end_tick,
+                    loop_range,
                     depth + 1,
                 )?
             }
@@ -242,6 +256,20 @@ fn parse_chunks(
                     return Err("short GLOB".into());
                 }
                 s.bpm = be(x, 2)? as f32 / 1000.;
+                s.song_mode = x[0] != 0;
+                s.looping = x[1] != 0;
+                s.shuffle = unit(x[14]) * 60.;
+                s.vintage = x.get(482).copied().unwrap_or(0) != 0;
+                let start = be(x, 6)?;
+                let end = be(x, 10)?;
+                if end == 0 {
+                    *loop_range = None;
+                } else {
+                    if end <= start || start % 768 != 0 || end % 768 != 0 || end / 768 > 4096 {
+                        return Err("invalid GLOB loop range; expected whole bars within 4096 bars".into());
+                    }
+                    *loop_range = Some((start / 768, end / 768));
+                }
                 s.name = String::from_utf8_lossy(&x[15..])
                     .split('\0')
                     .next()
@@ -281,6 +309,7 @@ fn parse_chunks(
                 }
                 s.slots[i] = x[1] as usize;
                 s.enabled[i] = x[0] != 0;
+                s.shuffle_tracks[i] = x[head + s.slots[i] * stride] != 0;
                 for c in 2..head {
                     apply_automation(
                         s,
@@ -288,7 +317,7 @@ fn parse_chunks(
                             tick: 0,
                             track: (i + 1) as u8,
                             controller: c as u8,
-                            value: x[c],
+                            value: rbs_control_value((i + 1) as u8, c as u8, x[c]),
                         },
                     );
                 }
@@ -369,7 +398,7 @@ fn parse_chunks(
                             tick: u32::try_from(tick).map_err(|_| "time overflow")?,
                             track: *track,
                             controller: c,
-                            value: v,
+                            value: rbs_control_value(*track, c, v),
                         })
                     }
                 }
@@ -390,7 +419,7 @@ fn parse_chunks(
                     s.channels[i].pan = unit(x[p + 2]) * 2. - 1.;
                     s.channels[i].delay = unit(x[p + 3]);
                     s.channels[i].distortion = x[p + 4] != 0;
-                    s.channels[i].filter = x[2] as usize == i + 2;
+                    s.channels[i].filter = x[2] as usize == i + 1;
                     s.channels[i].compressor = x[1] as usize == i + 2;
                 }
                 s.fx.compressor_master = x[1] == 1
@@ -415,7 +444,7 @@ fn parse_chunks(
                             tick: 0,
                             track: t,
                             controller: c as u8,
-                            value: x[c],
+                            value: rbs_control_value(t, c as u8, x[c]),
                         },
                     )
                 }
@@ -446,6 +475,7 @@ pub fn import(b: &[u8]) -> Result<Song, String> {
     let mut track = 0;
     let mut changes = std::array::from_fn(|_| Vec::new());
     let mut end = 0;
+    let mut loop_range = None;
     parse_chunks(
         b,
         12,
@@ -455,12 +485,14 @@ pub fn import(b: &[u8]) -> Result<Song, String> {
         &mut track,
         &mut changes,
         &mut end,
+        &mut loop_range,
         0,
     )?;
     if devices.iter().any(|v| !*v) || !(20. ..=500.).contains(&s.bpm) {
         return Err("missing instruments or tempo".into());
     }
-    let bars = ((end + 31) / 32).max(1);
+    let bars = (end / 32 + usize::from(end != 4096 * 32))
+        .max(loop_range.map_or(1, |(_, end)| end));
     if bars > 4096 {
         return Err("song exceeds 4096 bars".into());
     }
@@ -476,9 +508,13 @@ pub fn import(b: &[u8]) -> Result<Song, String> {
         }
         s.arrangement.push(slots)
     }
-    s.length = bars;
-    s.start = 0;
-    s.song_mode = true;
+    if let Some((start, end)) = loop_range {
+        s.start = start;
+        s.length = end - start;
+    } else {
+        s.start = 0;
+        s.length = bars;
+    }
     s.automation.sort_by_key(|e| (e.tick, e.track));
     s.validate()?;
     Ok(s)
@@ -734,17 +770,17 @@ mod tests {
             (
                 include_bytes!("../../../songs/rbs-examples/Peff-3pm.rbs").as_slice(),
                 90.,
-                563,
+                564,
             ),
             (
                 include_bytes!("../../../songs/rbs-examples/Plucked 303-01.rbs").as_slice(),
                 128.,
-                128,
+                129,
             ),
             (
                 include_bytes!("../../../songs/rbs-examples/ReBirthday.rbs").as_slice(),
                 116.,
-                179,
+                180,
             ),
         ] {
             let s = import(b).unwrap();
@@ -871,6 +907,163 @@ mod regression_mapping_tests {
         assert!(song.channels.iter().all(|c| !c.mute));
         assert_eq!(song.drums[0].voices[1].tone, 1.);
         assert_eq!(song.drums[0].voices[9].tone, 0.);
+    }
+    #[test]
+    fn global_settings_loop_and_delay_modes() {
+        let mut raw = include_bytes!("../../../songs/rbs-examples/Peff-3pm.rbs").to_vec();
+        let p = raw.windows(4).position(|x| x == b"GLOB").unwrap() + 8;
+        assert!(be(&raw, p - 4).unwrap() > 482);
+        raw[p] = 0;
+        raw[p + 1] = 0;
+        raw[p + 6..p + 10].copy_from_slice(&768u32.to_be_bytes());
+        raw[p + 10..p + 14].copy_from_slice(&2304u32.to_be_bytes());
+        raw[p + 14] = 64;
+        raw[p + 482] = 1;
+        let d = raw.windows(4).position(|x| x == b"DELY").unwrap() + 8;
+        raw[d + 2] = 0;
+        let song = import(&raw).unwrap();
+        assert!(!song.song_mode && !song.looping && song.vintage);
+        assert_eq!(song.shuffle, 64. / 127. * 60.);
+        assert_eq!((song.start, song.length), (1, 2));
+        assert!(song.arrangement.len() >= 3);
+        assert!(song.fx.delay_triplet);
+        raw[d + 2] = 1;
+        assert!(!import(&raw).unwrap().fx.delay_triplet);
+        let track = raw.windows(4).enumerate().filter(|(_, x)| *x == b"TRAK").nth(5).unwrap().0 + 8;
+        let count = be(&raw, track).unwrap();
+        let mut pos = track + 4;
+        let mut tick = 0;
+        let mut found = false;
+        for _ in 0..count {
+            let mut delta = 0;
+            loop {
+                let byte = raw[pos];
+                pos += 1;
+                delta = delta * 128 + (byte & 127) as u32;
+                if byte & 128 == 0 { break; }
+            }
+            tick += delta;
+            if raw[pos] == 2 {
+                raw[pos + 1] = 0;
+                found = true;
+                break;
+            }
+            pos += 2;
+        }
+        assert!(found);
+        assert!(import(&raw).unwrap().automation.iter().any(|e| e.track == 5 && e.controller == 2 && e.tick == tick && e.value == 1));
+        let mut song = Song::default();
+        event(&mut song, 5, 2, 1);
+        assert!(song.fx.delay_triplet);
+        event(&mut song, 5, 2, 0);
+        assert!(!song.fx.delay_triplet);
+        raw[p + 10..p + 14].copy_from_slice(&2305u32.to_be_bytes());
+        assert!(import(&raw).unwrap_err().contains("whole bars"));
+    }
+    #[test]
+    fn rbs_selectors_convert_at_import_boundary() {
+        let mut raw = include_bytes!("../../../songs/rbs-examples/Peff-3pm.rbs").to_vec();
+        let p = raw.windows(4).position(|x| x == b"808 ").unwrap() + 8;
+        for c in [11, 14, 17, 19, 21] { raw[p + c] = 0; }
+        let song = import(&raw).unwrap();
+        for i in [3, 4, 5, 6, 7] { assert!(song.drums[0].voices[i].variant); }
+        let mut song = Song::default();
+        event(&mut song, 3, 11, 0);
+        assert!(!song.drums[0].voices[3].variant);
+        event(&mut song, 3, 11, 1);
+        assert!(song.drums[0].voices[3].variant);
+        assert_eq!(rbs_control_value(5, 2, 0), 1);
+        assert_eq!(rbs_control_value(5, 2, 1), 0);
+        assert_eq!(rbs_control_value(3, 11, 0), 1);
+        assert_eq!(rbs_control_value(3, 11, 1), 0);
+    }
+    #[test]
+    fn rbs_filter_routing_uses_original_ids() {
+        let mut raw = include_bytes!("../../../songs/rbs-examples/Peff-3pm.rbs").to_vec();
+        let mixer = raw.windows(4).position(|x| x == b"MIXR").unwrap() + 8;
+        let track = raw.windows(4).position(|x| x == b"TRAK").unwrap() + 8;
+        let count = be(&raw, track).unwrap();
+        let mut pos = track + 4;
+        let mut tick = 0u32;
+        let mut event_pos = None;
+        for _ in 0..count {
+            let mut delta = 0;
+            loop {
+                let byte = raw[pos];
+                pos += 1;
+                delta = delta * 128 + (byte & 127) as u32;
+                if byte & 128 == 0 { break; }
+            }
+            tick += delta;
+            if raw[pos] == 2 { event_pos = Some((pos + 1, tick)); break; }
+            pos += 2;
+        }
+        let (value_pos, tick) = event_pos.unwrap();
+        for (source, channel) in [(1, 0), (4, 3)] {
+            raw[mixer + 2] = source;
+            raw[value_pos] = source;
+            let mut song = import(&raw).unwrap();
+            assert_eq!(song.channels.each_ref().map(|c| c.filter), std::array::from_fn(|i| i == channel));
+            let automation = song.automation.iter().find(|e| e.track == 0 && e.controller == 2 && e.tick == tick).unwrap().clone();
+            assert_eq!(automation.value, source + 1);
+            apply_automation(&mut song, &automation);
+            assert_eq!(song.channels.each_ref().map(|c| c.filter), std::array::from_fn(|i| i == channel));
+        }
+        let mut song = Song::default();
+        event(&mut song, 0, 2, 3);
+        assert_eq!(song.channels.each_ref().map(|c| c.filter), [false, true, false, false]);
+        assert_eq!(rbs_control_value(0, 2, 0), 0);
+        assert_eq!(rbs_control_value(0, 2, 255), 255);
+    }
+    #[test]
+    fn selected_pattern_shuffle_flag_is_imported() {
+        let mut raw = include_bytes!("../../../songs/rbs-examples/Peff-3pm.rbs").to_vec();
+        let glob = raw.windows(4).position(|x| x == b"GLOB").unwrap() + 8;
+        raw[glob + 14] = 127;
+        let device = raw.windows(4).position(|x| x == b"303 ").unwrap() + 8;
+        let slot = raw[device + 1] as usize;
+        raw[device + 9 + slot * 34] = 0;
+        let song = import(&raw).unwrap();
+        assert_eq!(song.shuffle, 60.);
+        assert!(!song.shuffle_tracks[0]);
+    }
+    #[test]
+    fn terminal_tick_fits_the_last_bar() {
+        let mut raw = include_bytes!("../../../songs/rbs-examples/Peff-3pm.rbs").to_vec();
+        let track = raw.windows(4).enumerate().filter(|(_, x)| *x == b"TRAK").nth(1).unwrap().0 + 8;
+        let count = be(&raw, track).unwrap();
+        let mut pos = track + 4;
+        let mut tick = 0usize;
+        let mut deltas = Vec::new();
+        for _ in 0..count {
+            let start = pos;
+            let mut delta = 0usize;
+            loop {
+                let byte = raw[pos];
+                pos += 1;
+                delta = delta * 128 + (byte & 127) as usize;
+                if byte & 128 == 0 { break; }
+            }
+            tick += delta;
+            if pos - start == 2 { deltas.push((start, delta)); }
+            pos += 2;
+        }
+        let mut remaining = 4096 * 32 - tick;
+        let mut last = None;
+        for (pos, delta) in deltas {
+            let add = remaining.min(16382 - delta);
+            let value = delta + add;
+            raw[pos] = 128 | (value >> 7) as u8;
+            raw[pos + 1] = (value & 127) as u8;
+            remaining -= add;
+            if add > 0 { last = Some((pos, value)); }
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(import(&raw).unwrap().arrangement.len(), 4096);
+        let (pos, value) = last.unwrap();
+        raw[pos] = 128 | ((value + 1) >> 7) as u8;
+        raw[pos + 1] = ((value + 1) & 127) as u8;
+        assert!(import(&raw).is_err());
     }
     #[test]
     fn rejects_truncated_chunks_and_oversized_declared_header() {
