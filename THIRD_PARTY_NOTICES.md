@@ -12,6 +12,12 @@ are listed in [native/THIRD_PARTY_NOTICES.md](native/THIRD_PARTY_NOTICES.md).
 
 ## Current synthesis and offline evaluation
 
+The pattern-controlled filter in `crates/engine/src/pcf.rs` adapts the PCF
+algorithm and pattern data from
+[OpenRB-338](https://github.com/pingw33n/OpenRB-338/tree/cbca4492c0224dffaa477346bc8860559f3d853f),
+revision `cbca4492c0224dffaa477346bc8860559f3d853f`, under GPL-3.0-only.
+The license is retained in [licenses/OpenRB-338-GPL-3.0.txt](licenses/OpenRB-338-GPL-3.0.txt).
+
 The acid synthesis uses an analytic oscillator, a pre-filter, a resonant filter
 pair, and a DC blocker. Drum synthesis uses colored noise and damped-mode
 profiles.

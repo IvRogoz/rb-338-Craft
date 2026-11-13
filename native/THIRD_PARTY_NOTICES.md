@@ -16,6 +16,12 @@ not included in this distribution.
 
 ## Current synthesis references
 
+The pattern-controlled filter in `crates/engine/src/pcf.rs` adapts the PCF
+algorithm and pattern data from
+[OpenRB-338](https://github.com/pingw33n/OpenRB-338/tree/cbca4492c0224dffaa477346bc8860559f3d853f),
+revision `cbca4492c0224dffaa477346bc8860559f3d853f`, under GPL-3.0-only.
+The license is retained in [licenses/OpenRB-338-GPL-3.0.txt](licenses/OpenRB-338-GPL-3.0.txt).
+
 The frequency-compensated filter coefficients and resonance control mapping in
 `crates/engine/src/acid.rs` adapt Open303's design.
 The fixed accented filter-envelope decay follows Open303's documented stock

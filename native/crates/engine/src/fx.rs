@@ -1,36 +1,7 @@
 use rb_model::Song;
-use std::f32::consts::PI;
 
-#[derive(Clone, Copy, Default)]
-struct Filter {
-    ic1: f32,
-    ic2: f32,
-    k: f32,
-    a1: f32,
-    a2: f32,
-    a3: f32,
-}
-impl Filter {
-    fn configure(&mut self, freq: f32, q: f32, sr: f32) {
-        let g = (PI * freq.clamp(20., sr * 0.42) / sr).tan();
-        self.k = 1. / q.clamp(0.5, 15.);
-        self.a1 = 1. / (1. + g * (g + self.k));
-        self.a2 = g * self.a1;
-        self.a3 = g * self.a2;
-    }
-    fn sample(&mut self, x: f32, bp: bool) -> f32 {
-        let v3 = x - self.ic2;
-        let v1 = self.a1 * self.ic1 + self.a2 * v3;
-        let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
-        self.ic1 = 2. * v1 - self.ic1;
-        self.ic2 = 2. * v2 - self.ic2;
-        if bp {
-            v1 * self.k.sqrt()
-        } else {
-            v2
-        }
-    }
-}
+#[path = "pcf.rs"]
+mod pcf;
 #[derive(Clone, Copy)]
 struct Compressor {
     env: f32,
@@ -87,14 +58,7 @@ pub struct Rack {
     delay_pan: [f32; 2],
     pans: [[f32; 2]; 4],
     master: f32,
-    filters: [Filter; 4],
-    env: f32,
-    target: f32,
-    attack: f32,
-    attack_left: usize,
-    decay: f32,
-    refresh: usize,
-    pcf_gain: f32,
+    pcf: pcf::Pcf,
     comp: [Compressor; 5],
     prev: [f32; 4],
     smooth: [f32; 4],
@@ -114,14 +78,7 @@ impl Rack {
             delay_pan: [1.; 2],
             pans: [[0.; 2]; 4],
             master: 0.,
-            filters: [Filter::default(); 4],
-            env: 0.,
-            target: 0.,
-            attack: 1.,
-            attack_left: 0,
-            decay: 0.,
-            refresh: 0,
-            pcf_gain: 1.,
+            pcf: pcf::Pcf::new(sr),
             comp: [Compressor::new(sr); 5],
             prev: [0.; 4],
             smooth: [0.; 4],
@@ -141,24 +98,15 @@ impl Rack {
             self.sends[i] = level_gain(s.channels[i].delay);
             self.pans[i] = pan_gains(s.channels[i].pan);
         }
-        // The PCF decay knob has sixteen logarithmic settings, with sustain at its maximum.
-        let step = (((s.fx.filter_decay - 0.1) / 9.9 * 127.).round() as usize / 8).min(15);
-        let seconds = [0.009, 0.013, 0.018, 0.023, 0.030, 0.045, 0.091, 0.130,
-            0.181, 0.227, 0.302, 0.453, 0.907, 1.296, 1.814, 1000.][step];
-        self.decay = if step == 15 { 1. } else { (-1. / (seconds * self.sr)).exp() };
         self.delay_target = (self.sr * 60. / s.bpm / (if s.fx.delay_triplet { 3. } else { 4. })
             * s.fx.delay_steps as f32)
             .clamp(1., self.delay.len() as f32 - 2.);
         if !self.started {
             self.delay_length = self.delay_target;
         }
-        self.refresh = 0;
     }
     pub fn clear(&mut self, echo: bool) {
-        self.filters = [Filter::default(); 4];
-        self.env = 0.;
-        self.target = 0.;
-        self.attack_left = 0;
+        self.pcf.clear();
         self.comp = [Compressor::new(self.sr); 5];
         self.prev = [0.; 4];
         self.smooth = [0.; 4];
@@ -168,61 +116,14 @@ impl Rack {
             self.started = false;
         }
     }
-    pub fn tick(&mut self, tick: usize, s: &Song) {
-        let (division, levels) = super::patterns::PATTERNS[s.fx.filter_pattern];
-        if tick % division == 0 {
-            let level = levels[(tick / division) % levels.len()];
-            if level > 0. {
-                let base = ((s.fx.filter_cutoff - 100.) / 7900.).clamp(0., 1.) * 508.;
-                let room = (511. - base) / (476. * s.fx.filter_amount).max(1e-6);
-                self.target = level.min(room);
-                self.attack_left = (self.sr
-                    * if s.fx.filter_pattern >= 12 {
-                        0.024
-                    } else {
-                        0.004
-                    }) as usize;
-                self.attack = 1.
-                    - (-1.
-                        / (self.sr
-                            * if s.fx.filter_pattern >= 12 {
-                                0.006
-                            } else {
-                                0.001
-                            }))
-                    .exp();
-            }
-        }
+    pub fn tick(&mut self, tick: usize, _s: &Song) {
+        self.pcf.tick(tick);
     }
     pub fn sample(&mut self, ch: [f32; 4], s: &Song, click: f32) -> [f32; 2] {
-        if self.attack_left > 0 {
-            self.env += (self.target - self.env) * self.attack;
-            self.attack_left -= 1;
-        } else {
-            self.target = 0.;
-            self.env *= self.decay;
-        }
         let f = &s.fx;
-        if self.refresh == 0 {
-            let base = ((f.filter_cutoff - 100.) / 7900.).clamp(0., 1.) * 508.;
-            let position = (base + self.env * f.filter_amount * 476.).clamp(0., 511.);
-            let resonance = ((f.filter_q - 0.5) / 14.5).clamp(0., 1.);
-            let cutoff = 17640. * ((position - 511.) * 0.01444).exp() * (0.6 + 0.4 * resonance);
-            let row = (resonance * 8.).floor().min(7.);
-            let weight = (position * position / 128000. - 0.3).clamp(0., 1.);
-            let q = 0.52 * 1.78_f32.powf(row) * weight + (0.5 + row / 6.) * (1. - weight);
-            let denominator = if q > 4. { 4. } else { q + 1. };
-            self.pcf_gain = if f.filter_mode == "BP" {
-                7.5 * q.sqrt() / denominator
-            } else {
-                2.5 / denominator
-            };
-            for filter in &mut self.filters {
-                filter.configure(cutoff, q, self.sr);
-            }
-            self.refresh = 32;
+        if f.filter_enabled && s.channels.iter().any(|c| c.filter) {
+            self.pcf.advance(s);
         }
-        self.refresh -= 1;
         let mut stereo = [0.; 2];
         let mut send = 0.;
         for i in 0..4 {
@@ -247,7 +148,7 @@ impl Rack {
             // ReBirth's inserts are serial: distortion, PCF, compressor.
             if c.filter && f.filter_enabled {
                 self.metrics[7] = self.metrics[7].max(x.abs());
-                x = self.filters[i].sample(x, f.filter_mode == "BP") * self.pcf_gain;
+                x = self.pcf.sample(i, x, f.filter_mode == "BP");
             }
             if c.compressor && f.compressor_enabled && !f.compressor_master {
                 self.metrics[10] = self.metrics[10].max(x.abs());
@@ -330,15 +231,20 @@ mod tests {
         assert_eq!(pan_gains(0.), [1., 1.]);
     }
     #[test]
-    fn pcf_middle_decay_is_short_and_maximum_sustains() {
-        let mut s = Song::default();
-        s.fx.filter_decay = 0.1 + 64. / 127. * 9.9;
-        let mut r = Rack::new(44100.);
-        r.configure(&s);
-        assert!((r.decay.powf(44100. * 0.181) - (-1.0_f32).exp()).abs() < 0.002);
-        s.fx.filter_decay = 10.;
-        r.configure(&s);
-        assert_eq!(r.decay, 1.);
+    fn pcf_bypass_pauses_state_and_clear_resets_it() {
+        let mut song = Song::default();
+        song.fx.filter_enabled = false;
+        song.fx.delay_enabled = false;
+        song.fx.compressor_enabled = false;
+        song.channels[0].filter = true;
+        let mut rack = Rack::new(44100.);
+        rack.configure(&song);
+        for _ in 0..64 { rack.sample([1., 0., 0., 0.], &song, 0.); }
+        song.fx.filter_enabled = true;
+        let first = rack.sample([1., 0., 0., 0.], &song, 0.);
+        rack.clear(true);
+        let reset = rack.sample([1., 0., 0., 0.], &song, 0.);
+        assert_eq!(first, reset);
     }
     #[test]
     fn pcf_amount_zero_retains_filter() {
@@ -352,7 +258,7 @@ mod tests {
         r.configure(&s);
         let mut energy = 0.;
         for i in 0..4800 {
-            let x = (2. * PI * 6000. * i as f32 / 48000.).sin();
+            let x = (2. * std::f32::consts::PI * 6000. * i as f32 / 48000.).sin();
             let y = r.sample([x, 0., 0., 0.], &s, 0.);
             energy += y[0] * y[0];
         }
@@ -372,24 +278,5 @@ mod tests {
         assert!(quiet.gain > 5. && quiet.gain.is_finite());
         for _ in 0..10000 { quiet.gain(0.01, -40., 1.); }
         assert!((quiet.gain - 1.).abs() < 1e-4);
-    }
-    #[test]
-    fn lower_pattern_level_retriggers_downwards() {
-        let mut s = Song::default();
-        s.fx.filter_pattern = 48;
-        let mut r = Rack::new(48000.);
-        r.configure(&s);
-        r.tick(0, &s);
-        for _ in 0..1152 {
-            r.sample([0.; 4], &s, 0.);
-        }
-        let high = r.env;
-        assert!(high > 0.85);
-        r.tick(1, &s);
-        assert!((r.target - 0.182).abs() < 1e-6);
-        for _ in 0..1152 {
-            r.sample([0.; 4], &s, 0.);
-        }
-        assert!(r.env < high * 0.3 && r.env > 0.18);
     }
 }

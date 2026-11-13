@@ -4,7 +4,6 @@ use std::collections::HashSet;
 mod acid;
 mod drums;
 mod fx;
-mod patterns;
 use acid::AcidVoice;
 use drums::DrumSynth;
 
