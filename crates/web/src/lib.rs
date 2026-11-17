@@ -15,6 +15,8 @@ extern "C" {
     fn start_audio(song: &str) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(js_name=setSong)]
     fn set_song(song: &str);
+    #[wasm_bindgen(js_name=setSongControls)]
+    fn set_song_controls(song: &str);
     fn command(cmd: u32, value: f64);
     #[wasm_bindgen(js_name=recordCommand)]
     fn record_command(value: f64, request_id: u32);
@@ -33,6 +35,10 @@ struct App {
     live_controls: Option<ControlState>,
     track: usize,
     voice: usize,
+    sample_kit: usize,
+    sample_voice: usize,
+    sample_requests: [[u32; 12]; 2],
+    last_samples: RefCell<Option<(rb_model::samples::SampleSlots, Option<std::sync::Arc<rb_model::samples::SampleBank>>)>>,
     clipboard: Option<(usize, Pattern)>,
     position: usize,
     playing: bool,
@@ -59,6 +65,11 @@ struct App {
     midi_inputs: Vec<(String, String)>,
     midi_clock: midi::MidiClock,
 }
+fn next_sample_request(requests: &mut [[u32; 12]; 2], kit: usize, voice: usize) -> u32 {
+    let request = &mut requests[kit][voice];
+    *request = request.wrapping_add(1);
+    *request
+}
 fn doc() -> Document {
     web_sys::window().unwrap().document().unwrap()
 }
@@ -69,6 +80,13 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
+fn song_json(song: &Song) -> Result<String, String> {
+    let json = serde_json::to_string(song).map_err(|e| e.to_string())?;
+    if json.len() > 16 * 1024 * 1024 {
+        return Err("Song JSON exceeds the 16 MiB limit.".into());
+    }
+    Ok(json)
+}
 fn btn(action: &str, label: &str) -> String {
     format!("<button data-action='{action}'>{label}</button>")
 }
@@ -77,9 +95,36 @@ fn digits(value: usize, width: usize) -> String {
         format!("<span class='digit d{c}'>{c}<i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>")
     }).collect()
 }
+fn same_samples(a: &rb_model::samples::SampleSlots, b: &rb_model::samples::SampleSlots) -> bool {
+    a.iter().flatten().zip(b.iter().flatten()).all(|(a, b)| match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        _ => false,
+    })
+}
+fn same_bank(a: &Option<std::sync::Arc<rb_model::samples::SampleBank>>, b: &Option<std::sync::Arc<rb_model::samples::SampleBank>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+fn song_without_samples(song: &Song) -> Song {
+    let mut controls = song.clone();
+    controls.samples = Default::default();
+    controls.loaded_bank = None;
+    controls
+}
 fn sync(a: &App) {
-    if let Ok(s) = serde_json::to_string(&a.song) {
+    let unchanged = a.audio_ready && a.last_samples.borrow().as_ref()
+        .is_some_and(|(samples, bank)| same_samples(samples, &a.song.samples) && same_bank(bank, &a.song.loaded_bank));
+    if unchanged {
+        if let Ok(s) = serde_json::to_string(&song_without_samples(&a.song)) {
+            set_song_controls(&s);
+        }
+    } else if let Ok(s) = serde_json::to_string(&a.song) {
         set_song(&s);
+        *a.last_samples.borrow_mut() = Some((a.song.samples.clone(), a.song.loaded_bank.clone()));
     }
 }
 fn status(s: &str) {
@@ -128,7 +173,7 @@ fn pattern_box(a: &App, t: usize) -> String {
             ["A", "B", "C", "D"][i]
         )
     }
-    h+=&format!("</div><div class='shuffle-label patlabel'>SHUFFLE {} &nbsp; STEPS</div><div class=length>{}<span class=led>{}</span>{}</div></div>",toggle(&format!("shuffle_track:{t}"),"●",a.song.shuffle_tracks[t]),btn(&format!("steps_down:{t}"),"−"),digits(p.lengths[t],2),btn(&format!("steps_up:{t}"),"+"));
+    h+=&format!("</div><div class='shuffle-label patlabel'>SHUFFLE {} &nbsp; STEPS</div><div class=length>{}<span class=led>{}</span>{}</div></div>",toggle(&format!("shuffle_track:{t}"),"●",a.song.shuffle_for(a.song.slots[t], t)),btn(&format!("steps_down:{t}"),"−"),digits(p.lengths[t],2),btn(&format!("steps_up:{t}"),"+"));
     h
 }
 fn mixer(a: &App, t: usize) -> String {
@@ -136,14 +181,14 @@ fn mixer(a: &App, t: usize) -> String {
     format!("<div class=mixstrip><div class=mixhead>{} MIX</div>{}<label class='fader mixlevel'>LEVEL<input aria-label='Track {} level' type=range data-key='channel:{t}:level' min=0 max=1 step=.01 value='{}'></label>{}{}{}{}<div id='channel-meter-{t}' class=smallmeter></div></div>",toggle(&format!("mute:{t}"),"●",!c.mute),knob("PAN",&format!("channel:{t}:pan"),c.pan,-1.,1.,0.01,"black"),t+1,c.level,knob("DELAY",&format!("channel:{t}:delay"),c.delay,0.,1.,0.01,"black"),toggle(&format!("dist:{t}"),"DIST",c.distortion),toggle(&format!("filter:{t}"),"PCF",c.filter),toggle(&format!("comp:{t}"),"COMP",c.compressor))
 }
 fn pitch_with_key(note: u8, key: u8) -> u8 {
-    let octave = (note / 12).clamp(2, 4);
+    let octave = (note / 12).clamp(3, 5);
     octave * 12 + key.min(12)
 }
 fn toggle_octave(note: u8, up: bool) -> u8 {
     let pitch = note % 12;
-    let octave = (note / 12).clamp(2, 4);
-    let desired = if up { 4 } else { 2 };
-    (if octave == desired { 3 } else { desired }) * 12 + pitch
+    let octave = (note / 12).clamp(3, 5);
+    let desired = if up { 5 } else { 3 };
+    (if octave == desired { 4 } else { desired }) * 12 + pitch
 }
 fn reset_editor(a: &mut App) {
     a.bank = a.song.slots.map(|slot| slot / 8);
@@ -174,12 +219,12 @@ fn synth_panel(a: &App, t: usize) -> String {
     h+=&format!("<div class=editstep>EDIT STEP<br><span class=led>{}</span></div></div><div class=synthbottom><div class=pitchmode>PITCH MODE{}{}{}</div><div class=pitchkeys>",digits(a.edit[t]+1,2),toggle(&format!("pitchmode:{t}"),if a.pitch_mode[t]{"ON"}else{"OFF"},a.pitch_mode[t]),btn(&format!("clear:{t}"),"CLEAR")," ");
     for i in 0..13 {
         let sharp = [1, 3, 6, 8, 10].contains(&i);
-        h+=&format!("<button aria-label='Synth {} pitch {}' class='pitch {} {}' data-action='pitchkey:{t}:{i}'>{}</button>",t+1,i,if sharp{"sharp"}else{"natural"},if (n.note%12==i as u8 && i<12 && !(i==0 && n.note>=48)) || (i==12 && n.note%12==0 && n.note>=48) {"selected"}else{""},["C","C♯","D","D♯","E","F","F♯","G","G♯","A","A♯","B","C"][i]);
+        h+=&format!("<button aria-label='Synth {} pitch {}' class='pitch {} {}' data-action='pitchkey:{t}:{i}'>{}</button>",t+1,i,if sharp{"sharp"}else{"natural"},if (n.note%12==i as u8 && i<12 && !(i==0 && n.note>=60)) || (i==12 && n.note%12==0 && n.note>=60) {"selected"}else{""},["C","C♯","D","D♯","E","F","F♯","G","G♯","A","A♯","B","C"][i]);
     }
     h.push_str("</div><div class=stepcontrols><span class=slide-display>𝄽<i></i></span>");
     for (key, label, on) in [
-        ("down", "▼ DOWN", n.note < 36),
-        ("up", "▲ UP", n.note >= 48),
+        ("down", "▼ DOWN", n.note < 48),
+        ("up", "▲ UP", n.note >= 60),
         ("note", "NOTE / PAUSE", n.gate),
         ("accent", "ACCENT", n.accent),
         ("slide", "SLIDE", n.slide),
@@ -419,6 +464,19 @@ fn render(a: &App) {
     let focus = doc().active_element().filter(|e| !e.id().is_empty()).map(|e| e.id());
     let s = &a.song;
     let mut h=format!("<header class=dialog-header><h2 id=song-title>SONG / FILE · LIBRARY</h2><button data-action=song_close aria-label='Close Song / File'>CLOSE</button></header><div id=song-status class=dialog-status role=status aria-live=polite></div><div class=tools><label>SONG <input id=name value='{}'></label>{}{}<select id=saves aria-label='Saved songs'>{}</select>{}{}<label>IMPORT <input id=import type=file accept='.rbs,.json'></label>{}{}{}{}<div class=chips>",esc(&s.name),btn("save","SAVE"),btn("download","DOWNLOAD JSON"),saved_options(),btn("load","LOAD"),btn("delete","DELETE"),btn("new","NEW"),btn("scene_add","ADD SCENE"),btn("scene_remove","REMOVE LAST"),btn("scene_clear","CLEAR SCENES"));
+    let ids = if a.sample_kit == 0 { &DRUM_IDS } else { &DRUM_IDS_B };
+    h += "<section class=sample-controls aria-label='Sample assignment'><strong>SAMPLE</strong> <label>KIT <select id=sample-kit>";
+    for (k, label) in ["808", "909"].iter().enumerate() {
+        h += &format!("<option value='{k}' {}>{label}</option>", if k == a.sample_kit { "selected" } else { "" });
+    }
+    h += "</select></label> <label>VOICE <select id=sample-voice>";
+    for (v, label) in ids.iter().enumerate().skip(1) {
+        h += &format!("<option value='{v}' {}>{label}</option>", if v == a.sample_voice { "selected" } else { "" });
+    }
+    let sample_name = s.samples[a.sample_kit][a.sample_voice].as_ref().map_or("Procedural", |sample| sample.name.as_str());
+    let frames: usize = s.samples.iter().flatten().flatten().map(|sample| sample.pcm.len()).sum::<usize>()
+        + s.loaded_bank.as_ref().map_or(0, |bank| bank.samples.iter().flatten().map(|sample| sample.pcm.len()).sum());
+    h += &format!("</select></label> <label>WAV <input id=sample-file type=file accept='.wav,audio/wav'></label> <span>{}</span> {} <small>Samples travel in JSON song saves; {frames} / 2,000,000 frames used, including the loaded bank.</small></section>", esc(sample_name), btn("sample_clear", "CLEAR SAMPLE"));
     for t in 0..4 {
         h += &format!("<div class=pattern-utilities>TRACK {} ", t + 1);
         for (action, label) in [
@@ -1160,7 +1218,7 @@ fn action(a: &mut App, action: &str) -> bool {
         }
         "shuffle_track" => {
             let t = idx(1).min(3);
-            a.song.shuffle_tracks[t] = !a.song.shuffle_tracks[t]
+            a.song.toggle_pattern_shuffle(t)
         }
         "steps_down" | "steps_up" => {
             let t = idx(1).min(3);
@@ -1319,7 +1377,7 @@ fn action(a: &mut App, action: &str) -> bool {
         "clear" => {
             if t < 2 {
                 for n in &mut a.song.patterns[slot].notes[t] {
-                    n.note = 36;
+                    n.note = 48;
                     n.gate = false;
                     n.accent = false;
                     n.slide = false
@@ -1334,7 +1392,7 @@ fn action(a: &mut App, action: &str) -> bool {
             if t < 2 {
                 for n in &mut a.song.patterns[slot].notes[t] {
                     n.gate = js_sys::Math::random() < 0.7;
-                    n.note = 36 + (js_sys::Math::random() * 24.) as u8;
+                    n.note = 48 + (js_sys::Math::random() * 24.) as u8;
                     n.accent = js_sys::Math::random() < 0.25;
                     n.slide = js_sys::Math::random() < 0.15
                 }
@@ -1408,6 +1466,13 @@ fn action(a: &mut App, action: &str) -> bool {
         "new" => {
             replace_song(a, Song::default());
         }
+        "sample_clear" => {
+            next_sample_request(&mut a.sample_requests, a.sample_kit, a.sample_voice);
+            if let Err(e) = a.song.clear_sample(a.sample_kit, a.sample_voice) {
+                status(&format!("Sample clear failed: {e}"));
+                return false;
+            }
+        }
         "save" => {
             if a.pending_ack.is_some() {
                 status("Finishing recording; please wait.");
@@ -1424,11 +1489,15 @@ fn action(a: &mut App, action: &str) -> bool {
                 return false;
             }
             a.song.name = name.clone();
+            let json = match song_json(&a.song) {
+                Ok(json) => json,
+                Err(e) => { status(&format!("Save failed: {e}")); return false; }
+            };
             match web_sys::window().unwrap().local_storage() {
                 Ok(Some(s)) => {
                     if let Err(e) = s.set_item(
                         &format!("rb338:{name}"),
-                        &serde_json::to_string(&a.song).unwrap(),
+                        &json,
                     ) {
                         status(&format!("Save failed: {e:?}"));
                         return false;
@@ -1475,7 +1544,10 @@ fn action(a: &mut App, action: &str) -> bool {
                 status("Finishing recording; please wait.");
                 return false;
             }
-            let json = serde_json::to_string_pretty(&a.song).unwrap();
+            let json = match song_json(&a.song) {
+                Ok(json) => json,
+                Err(e) => { status(&format!("Download failed: {e}")); return false; }
+            };
             let array = js_sys::Array::new();
             array.push(&JsValue::from_str(&json));
             if let Ok(blob) = web_sys::Blob::new_with_str_sequence(&array) {
@@ -1664,6 +1736,10 @@ pub fn run() -> Result<(), JsValue> {
         live_controls: None,
         track: 0,
         voice: 0,
+        sample_kit: 0,
+        sample_voice: 1,
+        sample_requests: [[0; 12]; 2],
+        last_samples: RefCell::new(None),
         clipboard: None,
         position: 0,
         playing: false,
@@ -1704,8 +1780,10 @@ pub fn run() -> Result<(), JsValue> {
     web_sys::window().unwrap().add_event_listener_with_callback("resize", resized.as_ref().unchecked_ref())?;
     resized.forget();
     let generation = Rc::new(Cell::new(0u32));
+    let song_generation = Rc::new(Cell::new(0u32));
     let a = app.clone();
     let generation_click = generation.clone();
+    let song_generation_click = song_generation.clone();
     let click = Closure::<dyn FnMut(Event)>::new(move |e: Event| {
         let Some(target) = e.target().and_then(|x| x.dyn_into::<Element>().ok()) else {
             return;
@@ -1724,6 +1802,9 @@ pub fn run() -> Result<(), JsValue> {
         }
         if ["stop", "new"].contains(&act.as_str()) {
             generation_click.set(generation_click.get().wrapping_add(1));
+        }
+        if act == "new" {
+            song_generation_click.set(song_generation_click.get().wrapping_add(1));
         }
         if act == "midi_enable" {
             if a.borrow().midi_enabled {
@@ -1867,6 +1948,7 @@ pub fn run() -> Result<(), JsValue> {
         } else if act == "load" {
             if action(&mut a.borrow_mut(), &act) {
                 generation_click.set(generation_click.get().wrapping_add(1));
+                song_generation_click.set(song_generation_click.get().wrapping_add(1));
                 render(&a.borrow());
             }
         } else if act.starts_with("voice:") {
@@ -1908,10 +1990,62 @@ pub fn run() -> Result<(), JsValue> {
     click.forget();
     let a = app.clone();
     let generation_change = generation.clone();
+    let song_generation_change = song_generation.clone();
     let change = Closure::<dyn FnMut(Event)>::new(move |e: Event| {
         let Some(target) = e.target().and_then(|x| x.dyn_into::<Element>().ok()) else {
             return;
         };
+        if e.type_() == "change" && (target.id() == "sample-kit" || target.id() == "sample-voice") {
+            if let Some(select) = target.dyn_ref::<HtmlSelectElement>() {
+                let mut state = a.borrow_mut();
+                if target.id() == "sample-kit" {
+                    state.sample_kit = select.value().parse::<usize>().unwrap_or(0).min(1);
+                } else {
+                    state.sample_voice = select.value().parse::<usize>().unwrap_or(1).clamp(1, 11);
+                }
+            }
+            render(&a.borrow());
+            return;
+        }
+        if e.type_() == "change" && target.id() == "sample-file" {
+            let Some(file) = target.dyn_into::<HtmlInputElement>().ok()
+                .and_then(|x| x.files()).and_then(|x| x.get(0)) else { return; };
+            let (kit, voice, request) = {
+                let mut state = a.borrow_mut();
+                let (kit, voice) = (state.sample_kit, state.sample_voice);
+                let request = next_sample_request(&mut state.sample_requests, kit, voice);
+                (kit, voice, request)
+            };
+            if file.size() > rb_model::samples::MAX_WAV_BYTES as f64 {
+                status("Sample load failed: WAV exceeds 32 MiB.");
+                return;
+            }
+            let generation_at_selection = song_generation_change.get();
+            let generation_sample = song_generation_change.clone();
+            let a = a.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let read = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await;
+                if a.borrow().sample_requests[kit][voice] != request {
+                    return;
+                }
+                match read {
+                    Ok(buf) => {
+                        if generation_sample.get() != generation_at_selection {
+                            status("Sample not loaded: the song changed.");
+                            return;
+                        }
+                        let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+                        let result = a.borrow_mut().song.load_sample(kit, voice, file.name(), &bytes);
+                        match result {
+                            Ok(()) => { sync(&a.borrow()); render(&a.borrow()); status("Sample loaded."); }
+                            Err(e) => status(&format!("Sample load failed: {e}")),
+                        }
+                    }
+                    Err(e) => status(&format!("Sample load failed: {e:?}")),
+                }
+            });
+            return;
+        }
         if target.id() == "import" {
             if e.type_() != "change" {
                 return;
@@ -1926,6 +2060,7 @@ pub fn run() -> Result<(), JsValue> {
             };
             let name = file.name().to_lowercase();
             let generation_import = generation_change.clone();
+            let song_generation_import = song_generation_change.clone();
             let a = a.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
@@ -1943,6 +2078,7 @@ pub fn run() -> Result<(), JsValue> {
                         match result {
                             Ok(song) => {
                                 generation_import.set(generation_import.get().wrapping_add(1));
+                                song_generation_import.set(song_generation_import.get().wrapping_add(1));
                                 replace_song(&mut a.borrow_mut(), song);
                                 render(&a.borrow());
                                 status("Song imported.")
@@ -2452,6 +2588,54 @@ pub fn run() -> Result<(), JsValue> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn controls_update_preserves_ui_samples_and_compares_identity() {
+        let mut song = rb_model::Song::default();
+        let sample = std::sync::Arc::new(rb_model::samples::CustomSample {
+            name: "tone.wav".into(), sample_rate: 44100, pcm: vec![123, -123],
+        });
+        song.samples[0][1] = Some(sample.clone());
+        let previous = song.samples.clone();
+        let bank = std::sync::Arc::new(rb_model::samples::SampleBank { name: "bank".into(), samples: vec![None; 46] });
+        song.loaded_bank = Some(bank.clone());
+        let previous_bank = song.loaded_bank.clone();
+        assert!(super::same_bank(&previous_bank, &song.loaded_bank));
+        assert!(super::same_samples(&previous, &song.samples));
+        let controls = super::song_without_samples(&song);
+        assert!(controls.samples.iter().flatten().all(Option::is_none));
+        assert!(controls.loaded_bank.is_none());
+        assert!(std::sync::Arc::ptr_eq(song.loaded_bank.as_ref().unwrap(), &bank));
+        song.loaded_bank = Some(std::sync::Arc::new((*bank).clone()));
+        assert!(!super::same_bank(&previous_bank, &song.loaded_bank));
+        song.loaded_bank = None;
+        assert!(!super::same_bank(&previous_bank, &song.loaded_bank));
+        assert!(std::sync::Arc::ptr_eq(song.samples[0][1].as_ref().unwrap(), &sample));
+        assert!(!serde_json::to_string(&controls).unwrap().contains("tone.wav"));
+        song.samples[0][1] = Some(std::sync::Arc::new((*sample).clone()));
+        assert!(!super::same_samples(&previous, &song.samples));
+        song.samples[0][1] = None;
+        assert!(!super::same_samples(&previous, &song.samples));
+    }
+    #[test]
+    fn song_json_rejects_oversized_serialized_output() {
+        let mut song = rb_model::Song::default();
+        assert!(super::song_json(&song).is_ok());
+        song.name = "x".repeat(16 * 1024 * 1024);
+        assert!(super::song_json(&song).unwrap_err().contains("16 MiB"));
+    }
+    #[test]
+    fn sample_requests_are_independent_and_invalidate_older_loads() {
+        let mut requests = [[0; 12]; 2];
+        let first = super::next_sample_request(&mut requests, 0, 1);
+        let other = super::next_sample_request(&mut requests, 1, 1);
+        let newer = super::next_sample_request(&mut requests, 0, 1);
+        assert_ne!(first, requests[0][1]);
+        assert_eq!(newer, requests[0][1]);
+        assert_eq!(other, requests[1][1]);
+        super::next_sample_request(&mut requests, 0, 1); // clear
+        assert_ne!(newer, requests[0][1]);
+        assert_eq!(other, requests[1][1]);
+    }
     use super::*;
     #[test]
     fn digits_pad_and_keep_only_numeric_text() {
@@ -2465,14 +2649,14 @@ mod tests {
     }
     #[test]
     fn pitch_selection_preserves_bounded_octave() {
-        assert_eq!(pitch_with_key(36, 7), 43);
-        assert_eq!(pitch_with_key(36, 12), 48);
-        assert_eq!(pitch_with_key(24, 7), 31);
         assert_eq!(pitch_with_key(48, 7), 55);
-        assert_eq!(toggle_octave(43, false), 31);
-        assert_eq!(toggle_octave(31, false), 43);
-        assert_eq!(toggle_octave(43, true), 55);
-        assert_eq!(toggle_octave(55, true), 43);
+        assert_eq!(pitch_with_key(48, 12), 60);
+        assert_eq!(pitch_with_key(36, 7), 43);
+        assert_eq!(pitch_with_key(60, 7), 67);
+        assert_eq!(toggle_octave(55, false), 43);
+        assert_eq!(toggle_octave(43, false), 55);
+        assert_eq!(toggle_octave(55, true), 67);
+        assert_eq!(toggle_octave(67, true), 55);
     }
     #[test]
     fn punch_removes_old_events_only_for_touched_lanes_across_loop() {
@@ -2594,6 +2778,10 @@ mod tests {
             live_controls: None,
             track: 0,
             voice: 0,
+            sample_kit: 0,
+            sample_voice: 1,
+            sample_requests: [[0; 12]; 2],
+            last_samples: RefCell::new(None),
             clipboard: None,
             position: 16,
             playing: true,

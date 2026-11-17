@@ -14,6 +14,7 @@ class RustProcessor extends AudioWorkletProcessor {
         if (this.failed) return;
         try {
           if (data.type === 'song') this.song(data.bytes);
+          else if (data.type === 'songControls') this.song(data.bytes, true);
           else if (data.type === 'command') {
             this.wasm.rb_command(data.command, data.value);
             if (data.command === 0 || data.command === 6) {
@@ -29,10 +30,11 @@ class RustProcessor extends AudioWorkletProcessor {
     this.failed = true;
     this.port.postMessage({type: 'error', message: String(error)});
   }
-  song(bytes) {
+  song(bytes, controlsOnly = false) {
     if (bytes.length > this.wasm.rb_input_capacity()) throw new Error('Song is too large');
     new Uint8Array(this.wasm.memory.buffer, this.wasm.rb_input_ptr(), bytes.length).set(bytes);
-    if (this.wasm.rb_set_song(bytes.length) !== 0) throw new Error('Rust engine rejected song data');
+    const result = controlsOnly ? this.wasm.rb_set_song_controls(bytes.length) : this.wasm.rb_set_song(bytes.length);
+    if (result !== 0) throw new Error('Rust engine rejected song data');
   }
   publish(extra = {}) {
     const metrics = Array.from(new Float32Array(this.wasm.memory.buffer, this.wasm.rb_metrics_ptr(), 11));

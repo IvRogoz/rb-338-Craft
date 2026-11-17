@@ -134,32 +134,46 @@ impl Controller {
         true
     }
     pub fn load_path(&mut self, path: &Path) -> Result<(), String> {
-        use std::io::Read;
-        const MAX_FILE: u64 = 16 * 1024 * 1024;
-        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        if file.metadata().map_err(|e| e.to_string())?.len() > MAX_FILE {
-            return Err("Song file exceeds 16 MiB".into());
-        }
-        let mut data = Vec::new();
-        file.take(MAX_FILE + 1)
-            .read_to_end(&mut data)
-            .map_err(|e| e.to_string())?;
-        if data.len() as u64 > MAX_FILE {
-            return Err("Song file exceeds 16 MiB".into());
-        }
-        let song = rb_model::rbs::import(&data).or_else(|_| {
-            let text = std::str::from_utf8(&data).map_err(|e| e.to_string())?;
-            Song::from_json(text).or_else(|_| rb_model::rbs::import_legacy(text))
-        })?;
-        song.validate()?;
+        let song = crate::sample_banks::load_path(path)?;
         if !self.install_song(song) {
             return Err(self.status.clone());
         }
         Ok(())
     }
+    pub fn load_sample_path(
+        &mut self,
+        path: &Path,
+        kit: usize,
+        voice: usize,
+    ) -> Result<(), String> {
+        use std::io::Read;
+        let limit = rb_model::samples::MAX_WAV_BYTES as u64;
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        if file.metadata().map_err(|e| e.to_string())?.len() > limit {
+            return Err("WAV sample exceeds 32 MiB".into());
+        }
+        let mut data = Vec::new();
+        file.take(limit + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| e.to_string())?;
+        if data.len() as u64 > limit {
+            return Err("WAV sample exceeds 32 MiB".into());
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        self.song.load_sample(kit, voice, name, &data)?;
+        self.sync();
+        Ok(())
+    }
     pub fn save_path(&self, path: &Path) -> Result<(), String> {
         self.song.validate()?;
-        let data = serde_json::to_vec_pretty(&self.song).map_err(|e| e.to_string())?;
+        let data = serde_json::to_vec(&self.song).map_err(|e| e.to_string())?;
+        if data.len() > 16 * 1024 * 1024 {
+            return Err("Song exceeds the 16 MiB JSON import limit".into());
+        }
         atomic_write(path, &data)
     }
     pub fn export_wav(&self, path: &Path) -> Result<(), String> {
@@ -274,13 +288,13 @@ fn random() -> f64 {
     (x >> 11) as f64 / (1u64 << 53) as f64
 }
 fn pitch_with_key(note: u8, key: u8) -> u8 {
-    (note / 12).clamp(2, 4) * 12 + key.min(12)
+    (note / 12).clamp(3, 5) * 12 + key.min(12)
 }
 fn toggle_octave(note: u8, up: bool) -> u8 {
     let pitch = note % 12;
-    let octave = (note / 12).clamp(2, 4);
-    let desired = if up { 4 } else { 2 };
-    (if octave == desired { 3 } else { desired }) * 12 + pitch
+    let octave = (note / 12).clamp(3, 5);
+    let desired = if up { 5 } else { 3 };
+    (if octave == desired { 4 } else { desired }) * 12 + pitch
 }
 struct Punch {
     old: Vec<rb_model::Automation>,
@@ -394,7 +408,7 @@ fn record_control(a: &mut Controller, key: &str, v: f64) {
                     (1, 3),
                     (1, 2),
                     (2, 0),
-                    (2, 1),
+                    (2, 3),
                     (2, 4),
                     (3, 0),
                     (3, 1),
@@ -639,7 +653,7 @@ fn perform_action(a: &mut Controller, action: &str) -> bool {
         }
         "shuffle_track" => {
             let t = idx(1).min(3);
-            a.song.shuffle_tracks[t] = !a.song.shuffle_tracks[t]
+            a.song.toggle_pattern_shuffle(t)
         }
         "steps_down" | "steps_up" => {
             let t = idx(1).min(3);
@@ -757,9 +771,18 @@ fn perform_action(a: &mut Controller, action: &str) -> bool {
             let v = idx(2).min(11);
             let n = &mut a.song.patterns[a.song.slots[k + 2]].drums[k][v][idx(3).min(15)];
             *n = if k == 1 && v != 0 && a.flam {
-                match *n { 0 | 1 => 3, 2 => 4, _ => 0 }
+                match *n {
+                    0 | 1 => 3,
+                    2 => 4,
+                    _ => 0,
+                }
             } else if k == 1 && v != 0 {
-                match *n { 0 => 1, 1 => 2, 3 => 4, _ => 0 }
+                match *n {
+                    0 => 1,
+                    1 => 2,
+                    3 => 4,
+                    _ => 0,
+                }
             } else if k == 1 && a.flam {
                 if *n == 3 {
                     0
@@ -782,7 +805,16 @@ fn perform_action(a: &mut Controller, action: &str) -> bool {
                 if t < 2 && *source < 2 {
                     a.song.patterns[slot].notes[t] = p.notes[*source].clone()
                 } else if t >= 2 && *source >= 2 {
-                    a.song.patterns[slot].drums[t - 2] = p.drums[*source - 2].clone()
+                    a.song.patterns[slot].drums[t - 2] = p.drums[*source - 2].clone();
+                    if *source == 3 && t == 2 {
+                        for row in &mut a.song.patterns[slot].drums[0] {
+                            for step in row {
+                                if *step == 4 {
+                                    *step = 3;
+                                }
+                            }
+                        }
+                    }
                 } else {
                     a.status = format!("Copy between matching track types.");
                     return false;
@@ -793,7 +825,7 @@ fn perform_action(a: &mut Controller, action: &str) -> bool {
         "clear" => {
             if t < 2 {
                 for n in &mut a.song.patterns[slot].notes[t] {
-                    n.note = 36;
+                    n.note = 48;
                     n.gate = false;
                     n.accent = false;
                     n.slide = false
@@ -808,7 +840,7 @@ fn perform_action(a: &mut Controller, action: &str) -> bool {
             if t < 2 {
                 for n in &mut a.song.patterns[slot].notes[t] {
                     n.gate = random() < 0.7;
-                    n.note = 36 + (random() * 24.) as u8;
+                    n.note = 48 + (random() * 24.) as u8;
                     n.accent = random() < 0.25;
                     n.slide = random() < 0.15
                 }
@@ -1060,6 +1092,50 @@ fn midi_panel(a: &mut Controller, note: u8) -> Option<String> {
 #[cfg(test)]
 mod controller_tests {
     use super::*;
+    #[test]
+    fn snare_tone_records_and_replays_without_changing_tune() {
+        let (audio, _rx) = AudioBackend::offline();
+        let mut c = Controller::new(audio);
+        c.song.song_mode = true;
+        c.action("record");
+        c.song.drums[0].voices[2].tune = 2.;
+        c.song.drums[0].voices[2].tone = 64. / 127.;
+        c.changed("drum:0:2:tone", 64. / 127.);
+        let event = &c.song.automation[0];
+        assert_eq!((event.track, event.controller, event.value), (3, 7, 64));
+        let mut replay = Song::default();
+        replay.drums[0].voices[2].tune = 2.;
+        rb_model::rbs::apply_automation(&mut replay, event);
+        assert_eq!(replay.drums[0].voices[2].tone, 64. / 127.);
+        assert_eq!(replay.drums[0].voices[2].tune, 2.);
+    }
+    #[test]
+    fn paste_909_flam_into_808_remains_saveable() {
+        let (audio, _rx) = AudioBackend::offline();
+        let mut c = Controller::new(audio);
+        let source = c.song.slots[3];
+        c.song.patterns[source].drums[1][2][..5].copy_from_slice(&[0, 1, 2, 3, 4]);
+        c.action("copy:3");
+        c.action("paste:2");
+        let target = c.song.slots[2];
+        assert_eq!(&c.song.patterns[target].drums[0][2][..5], &[0, 1, 2, 3, 3]);
+        let path = std::env::temp_dir().join(format!("rb338-paste-test-{}.json", std::process::id()));
+        c.save_path(&path).unwrap();
+        let loaded = Song::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.patterns[target].drums[0][2][4], 3);
+        c.action("paste:3");
+        assert_eq!(c.song.patterns[source].drums[1][2][4], 4);
+    }
+    #[test]
+    fn pitch_keys_and_octaves_use_imported_c_base() {
+        assert_eq!(pitch_with_key(48, 0), 48);
+        assert_eq!(pitch_with_key(48, 12), 60);
+        assert_eq!(toggle_octave(48, false), 36);
+        assert_eq!(toggle_octave(36, false), 48);
+        assert_eq!(toggle_octave(48, true), 60);
+        assert_eq!(toggle_octave(60, true), 48);
+    }
     #[test]
     fn stopped_toggle_uses_displayed_song_value() {
         let mut song = Song::default();

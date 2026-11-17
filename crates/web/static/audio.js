@@ -10,8 +10,8 @@ function report(error) {
 }
 export async function startAudio(songJson) {
   latestSong = songJson;
+  if (processor) { setSong(latestSong); await context.resume(); return; }
   if (context) await context.resume();
-  if (processor) { setSong(latestSong); return; }
   if (initialization) return initialization;
   context = new AudioContext({latencyHint: 'interactive'});
   outputGain = context.createGain();
@@ -60,6 +60,9 @@ export async function startAudio(songJson) {
 export function setSong(json) {
   latestSong = json;
   if (processor) processor.port.postMessage({type: 'song', bytes: encoder.encode(json)});
+}
+export function setSongControls(json) {
+  if (processor) processor.port.postMessage({type: 'songControls', bytes: encoder.encode(json)});
 }
 export function command(command, value = 0, requestId = 0) {
   if (command === 4) metronome = value;

@@ -68,7 +68,7 @@ pub fn apply_automation(song: &mut Song, e: &Automation) {
                 Some((1, 3)),
                 Some((1, 2)),
                 Some((2, 0)),
-                Some((2, 1)),
+                Some((2, 3)),
                 Some((2, 4)),
                 Some((3, 0)),
                 Some((3, 1)),
@@ -202,7 +202,7 @@ pub fn apply_automation(song: &mut Song, e: &Automation) {
         8 => match c {
             0 => song.fx.compressor_enabled = v != 0,
             1 => song.fx.compressor_ratio = 1. + u * 19.,
-            2 => song.fx.compressor_threshold = (20. * u.max(0.01).log10()).max(-40.),
+            2 => song.fx.compressor_threshold = (20. * u.max(0.001).log10()).max(-60.),
             _ => {}
         },
         _ => {}
@@ -283,6 +283,12 @@ fn parse_chunks(
                     }
                     *loop_range = Some((start / 768, end / 768));
                 }
+                s.sample_bank = String::from_utf8_lossy(&x[15..x.len().min(80)])
+                    .split('\0')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 s.name = String::from_utf8_lossy(&x[15..])
                     .split('\0')
                     .next()
@@ -336,6 +342,7 @@ fn parse_chunks(
                 }
                 for slot in 0..32 {
                     let p = head + slot * stride;
+                    s.patterns[slot].shuffle_tracks.get_or_insert([false; 4])[i] = x[p] != 0;
                     let len = x[p + 1] as usize;
                     if len > 16 {
                         return Err("invalid pattern length".into());
@@ -348,15 +355,9 @@ fn parse_chunks(
                             if pitch > 12 {
                                 return Err("invalid pitch".into());
                             }
-                            let octave = if flags & 4 != 0 {
-                                12
-                            } else if flags & 8 != 0 {
-                                -12
-                            } else {
-                                0
-                            };
+                            let octave = 12 * (i32::from(flags & 4 != 0) - i32::from(flags & 8 != 0));
                             s.patterns[slot].notes[i][n] = Note {
-                                note: (36 + pitch as i32 + octave) as u8,
+                                note: (48 + pitch as i32 + octave) as u8,
                                 gate: flags & 16 == 0 && n < len,
                                 accent: flags & 2 != 0,
                                 slide: flags & 1 != 0,
@@ -893,7 +894,7 @@ mod regression_mapping_tests {
         assert_eq!(song.synth[0].tune, -12.);
         event(&mut song, 1, 2, 127);
         assert_eq!(song.synth[0].tune, 12.);
-        for (control, id) in [(4, 1), (24, 9)] {
+        for (control, id) in [(4, 1), (7, 2), (24, 9)] {
             let old = song.drums[0].voices[id].tune;
             event(&mut song, 3, control, 0);
             assert_eq!(song.drums[0].voices[id].tone, 0.);
@@ -904,6 +905,23 @@ mod regression_mapping_tests {
         event(&mut song, 5, 3, 127);
         assert_eq!(song.fx.delay_feedback, 1.);
         assert!(song.validate().is_ok());
+    }
+    #[test]
+    fn rbs_note_octaves_and_low_compressor_thresholds_match_reference() {
+        let mut raw = include_bytes!("../../../songs/rbs-examples/Peff-3pm.rbs").to_vec();
+        let p = raw.windows(4).position(|x| x == b"303 ").unwrap() + 8;
+        // The 303's nine-byte device header precedes the first pattern.
+        let pattern = p + 9;
+        for (flags, expected) in [(0,48),(4,60),(8,36),(12,48)] {
+            raw[pattern + 2] = 0; raw[pattern + 3] = flags;
+            assert_eq!(import(&raw).unwrap().patterns[0].notes[0][0].note,expected);
+        }
+        let mut song = Song::default();
+        for raw in 0..=127 {
+            event(&mut song,8,2,raw);
+            let recovered = (10_f32.powf(song.fx.compressor_threshold/20.)*127.).round() as u8;
+            assert_eq!(recovered,raw);
+        }
     }
     #[test]
     fn rbs_device_state_and_tone_bytes() {
@@ -1041,6 +1059,32 @@ mod regression_mapping_tests {
         assert!(!song.shuffle_tracks[0]);
     }
     #[test]
+    fn pattern_shuffle_import_and_legacy_json_fallback() {
+        let mut raw = include_bytes!("../../../songs/rbs-examples/Peff-3pm.rbs").to_vec();
+        let device = raw.windows(4).position(|x| x == b"303 ").unwrap() + 8;
+        raw[device + 9] = 0;
+        raw[device + 9 + 34] = 1;
+        let mut song = import(&raw).unwrap();
+        assert!(!song.shuffle_for(0, 0));
+        assert!(song.shuffle_for(1, 0));
+        song.slots[0] = 0;
+        song.toggle_pattern_shuffle(0);
+        assert!(song.shuffle_for(0, 0));
+        assert!(song.shuffle_for(1, 0));
+        let mut json = serde_json::to_value(&song).unwrap();
+        for pattern in json["patterns"].as_array_mut().unwrap() {
+            pattern.as_object_mut().unwrap().remove("shuffle_tracks");
+        }
+        let mut old: Song = serde_json::from_value(json).unwrap();
+        assert!(old.patterns.iter().all(|p| p.shuffle_tracks.is_none()));
+        let before = old.shuffle_tracks[0];
+        assert_eq!(old.shuffle_for(1, 0), before);
+        old.toggle_pattern_shuffle(0);
+        assert_eq!(old.shuffle_for(1, 0), !before);
+        let roundtrip: Song = serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        assert_eq!(roundtrip.shuffle_for(1, 0), !before);
+    }
+    #[test]
     fn terminal_tick_fits_the_last_bar() {
         let mut raw = include_bytes!("../../../songs/rbs-examples/Peff-3pm.rbs").to_vec();
         let track = raw.windows(4).enumerate().filter(|(_, x)| *x == b"TRAK").nth(1).unwrap().0 + 8;
@@ -1120,5 +1164,29 @@ mod fidelity_control_tests {
             apply_automation(&mut song,&Automation{tick:0,track:1,controller:2,value:rbs_control_value(1,2,raw)});
             assert_eq!(song.synth[0].tune.round(),semitones);
         }
+    }
+}
+
+#[cfg(test)]
+mod sample_bank_tests {
+    use super::*;
+    #[test]
+    fn rbs_bank_name_and_old_json_default() {
+        let raw = include_bytes!("../../../songs/rbs-examples/lightspe.rbs");
+        let song = import(raw).unwrap();
+        assert_eq!(song.sample_bank, "Trancer");
+        assert_eq!(song.name, "Trancer");
+        let mut json = serde_json::to_value(&song).unwrap();
+        json.as_object_mut().unwrap().remove("sample_bank");
+        let old: Song = serde_json::from_value(json).unwrap();
+        assert_eq!(old.sample_bank, "");
+        let mut standard = raw.to_vec();
+        let glob = standard.windows(4).position(|x| x == b"GLOB").unwrap() + 8;
+        standard[glob + 15..glob + 80].fill(0);
+        standard[glob + 15..glob + 31].copy_from_slice(b"Standard ReBirth");
+        let song = import(&standard).unwrap();
+        assert_eq!(song.sample_bank, "Standard ReBirth");
+        standard[glob + 15..glob + 80].fill(0);
+        assert_eq!(import(&standard).unwrap().sample_bank, "");
     }
 }

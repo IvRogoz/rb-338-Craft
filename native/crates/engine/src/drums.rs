@@ -1,4 +1,4 @@
-//! Generated percussion: reduced sound models, not recordings or circuit solvers.
+//! Procedural percussion and reference sample-bank voices.
 use rb_model::DrumKit;
 use std::f32::consts::TAU;
 #[path = "percussion_color.rs"]
@@ -237,11 +237,33 @@ fn membrane_sample(v: &mut Voice, sr: f32) -> f32 {
     out * fade * v.env
 }
 
+struct SampleVoice {
+    sample: std::sync::Arc<rb_model::samples::CustomSample>,
+    position: f64,
+    velocity: f32,
+    env: f32,
+    choke: f32,
+    noise: Option<std::sync::Arc<rb_model::samples::CustomSample>>,
+    bank_pitch: Option<f64>,
+    noise_mix: f32,
+    bank_gain: f32,
+    bank_pitched: bool,
+    bank_ended: bool,
+    bank_env: f64,
+    bank_fall: f32,
+    bank_hold: f64,
+    bank_clock: f64,
+    filter_pole: Option<f32>,
+    filter_state: f64,
+}
 pub struct DrumSynth {
     sr: f32,
     kit: usize,
     voices: [Voice; 12],
     kick_tail: Option<Voice>,
+    samples: [Option<SampleVoice>; 12],
+    bank_kick_tail: Option<SampleVoice>,
+    snare_count: usize,
 }
 impl DrumSynth {
     pub fn new(sr: f32, kit: usize) -> Self {
@@ -255,11 +277,97 @@ impl DrumSynth {
             kit: kit.min(1),
             voices: [Voice::default(); 12],
             kick_tail: None,
+            samples: std::array::from_fn(|_| None),
+            bank_kick_tail: None,
+            snare_count: 0,
         }
     }
     pub fn clear(&mut self) {
         self.voices = [Voice::default(); 12];
         self.kick_tail = None;
+        self.bank_kick_tail = None;
+        self.samples = std::array::from_fn(|_| None);
+    }
+    pub fn trigger_sample(&mut self, id: usize, velocity: f32, kit: &DrumKit, sample: Option<&std::sync::Arc<rb_model::samples::CustomSample>>) {
+        if id == 0 || id >= 12 || kit.voices.len() != 12 || !velocity.is_finite() { return; }
+        let open = if self.kit == 0 && id == 11 { Some(10) } else if self.kit == 1 && id == 8 { Some(9) } else { None };
+        if let Some(open) = open { if let Some(v) = &mut self.samples[open] { if v.bank_pitch.is_some() { v.bank_hold = 0.; if self.kit == 1 { v.bank_fall = 0.996; } } else { v.choke = 0.998_f32.powf(44100. / (2. * self.sr)); } } }
+        self.samples[id] = None;
+        self.trigger(id, velocity, kit);
+        if let Some(sample) = sample {
+            self.voices[id] = Voice::default();
+            if id == 1 { self.kick_tail = None; self.bank_kick_tail = None; }
+            self.samples[id] = Some(SampleVoice { sample: sample.clone(), position: 0., velocity: velocity.clamp(0.,64.), env: 1., choke: 1., noise: None, bank_pitch: None, noise_mix: 0., bank_gain: 0., bank_pitched: false, bank_ended: false, bank_env: 1., bank_fall: 1., bank_hold: 0., bank_clock: 0., filter_pole: None, filter_state: 0. });
+        }
+    }
+    // Resource mapping and step quantization follow OpenRB-338, GPL-3.0,
+    // commit cbca4492c0224dffaa477346bc8860559f3d853f, tr808.rs/tr909.rs.
+    pub fn trigger_bank(&mut self, id: usize, velocity: f32, kit: &DrumKit,
+        manual: Option<&std::sync::Arc<rb_model::samples::CustomSample>>,
+        bank: Option<&std::sync::Arc<rb_model::samples::SampleBank>>) {
+        if manual.is_some() || bank.is_none() || id == 0 || id >= 12 || kit.voices.len() != 12 {
+            self.trigger_sample(id, velocity, kit, manual);
+            return;
+        }
+        let d = &kit.voices[id];
+        let raw = (((d.tune + 6.) / 12. * 127.).round() as usize).min(127);
+        let tone = (d.tone * 127.).round().clamp(0.,127.) as usize;
+        let (resource, noise, pitched) = if self.kit == 0 {
+            match id {
+                1 => (0,None,false),
+                2 => { const SEQ: [usize;32] = [0,1,2,3,1,0,3,1,0,3,2,1,0,2,3,1,0,2,3,2,0,1,2,0,3,1,2,0,1,3,2,1];
+                    self.snare_count=(self.snare_count+1)%32;
+                    (1+tone*5/128,Some(6+SEQ[self.snare_count]),false) },
+                3 => (if d.variant {17} else {18},None,true),
+                4 => (if d.variant {20} else {21},None,true),
+                5 => (if d.variant {15} else {16},None,true),
+                6 => (if d.variant {12} else {23},None,false),
+                7 => (if d.variant {19} else {13},None,false),
+                8 => (10,None,false), 9 => (14,None,false),
+                10 => (22,None,false), 11 => (11,None,false),
+                _ => unreachable!(),
+            }
+        } else {
+            match id {
+                1 => (25+raw/32,None,false),
+                2 => { const SEQ: [usize;32] = [0,1,2,0,1,0,2,1,0,1,2,1,0,2,0,1,0,2,0,2,0,1,2,0,2,1,2,0,2,1,2,1];
+                    self.snare_count=(self.snare_count+1)%32;
+                    (29+raw*5/128,Some(34+SEQ[self.snare_count]),false) },
+                3..=5 => (34+id,None,true), 6..=11 => (34+id,None,id>=10),
+                _ => unreachable!(),
+            }
+        };
+        let bank=bank.unwrap();
+        let primary=bank.samples.get(resource).and_then(Option::as_ref);
+        let secondary=noise.and_then(|i| bank.samples.get(i).and_then(Option::as_ref));
+        if primary.is_none() || (noise.is_some() && secondary.is_none()) {
+            self.trigger_sample(id, velocity, kit, None);
+            return;
+        }
+        let mut tail = if id == 1 { self.samples[1].take().filter(|v| v.bank_pitch.is_some()) } else { None };
+        if let Some(v) = &mut tail { v.bank_fall = 0.99; v.bank_hold = 0.; }
+        self.trigger_sample(id, velocity, kit, primary);
+        if id == 1 { self.bank_kick_tail = tail; }
+        let sample = self.samples[id].as_mut().unwrap();
+        sample.noise = secondary.cloned();
+        let snappy = (d.snappy.clamp(0., 1.) * 127.).round() as f64;
+        sample.noise_mix = if self.kit == 0 { (snappy * f32::from_bits(0x3c01_0204) as f64).powi(2) as f32 } else { (snappy * f32::from_bits(0x3c23_d70a) as f64) as f32 };
+        let exponent = if self.kit == 0 {192.} else {144.};
+        sample.bank_pitched = pitched;
+
+        sample.bank_fall = if id == 1 || (self.kit == 0 && id == 9) || (self.kit == 1 && (3..=5).contains(&id)) || (self.kit == 1 && (id == 8 || id == 9)) {
+            bank_decay(d.decay, if self.kit == 0 { 0 } else if id == 8 { 8 } else { 1 })
+        } else if self.kit == 0 && id == 10 { 0.998 } else if self.kit == 1 && id == 2 { 0.998 } else { 1. };
+        sample.bank_hold = if self.kit == 0 && id == 10 { 4. * (((d.decay - 0.3) / 1.7).clamp(0., 1.) * 127.).round() as f64 * 64. } else if self.kit == 1 && id == 2 { (tone + 30) as f64 * 64. } else { 0. };
+        if id == 1 || (self.kit == 0 && id == 9) {
+            sample.filter_pole = Some(if self.kit == 0 { [0.9939_f32, 0.9757, 0.906, 0.822, 0.675, 0.456, 0.208, 0.001][(tone >> 4).min(7)] } else {
+                [0.92_f32, 0.87, 0.8, 0.72, 0.62, 0.5, 0.3, 0.001][((d.attack.clamp(0.,1.) * 8.) as usize).min(7)]
+            });
+        }
+        let gain = bank_trigger_gain(self.kit, id, d.level, velocity.clamp(0., 64.), sample.filter_pole);
+        sample.bank_gain = (gain as f64 / 32768.) as f32;
+        sample.bank_env = if secondary.is_some() { sample.noise_mix as f64 } else { sample.bank_gain as f64 };
+        sample.bank_pitch = Some(if pitched { if raw == 64 {1.} else {(256. * 2_f64.powf((raw as f64 - 64.) / exponent)).floor() / 256.} } else {1.});
     }
     pub fn trigger(&mut self, id: usize, velocity: f32, kit: &DrumKit) {
         if id == 0 || id >= 12 || kit.voices.len() != 12 || !velocity.is_finite() {
@@ -448,6 +556,11 @@ impl DrumSynth {
         let mut out = 0.;
         for id in 1..12 {
             let d = &kit.voices[id];
+            if let Some(v) = &mut self.samples[id] {
+                if let Some(sound) = sample_voice(v, d, self.kit, id, sr) { out += sound; }
+                else { self.samples[id] = None; }
+                continue;
+            }
             let v = &mut self.voices[id];
             if v.env < 1e-6 && v.body < 1e-6 && v.noise < 1e-6 {
                 continue;
@@ -509,6 +622,10 @@ impl DrumSynth {
             out += sound * v.velocity * voice_gain(self.kit, id, d.level);
             advance(v);
         }
+        if let Some(v) = &mut self.bank_kick_tail {
+            if let Some(sound) = sample_voice(v, &kit.voices[1], self.kit, 1, sr) { out += sound; }
+            else { self.bank_kick_tail = None; }
+        }
         if let Some(v) = &mut self.kick_tail {
             if v.env > 1e-6 {
                 out +=
@@ -518,6 +635,75 @@ impl DrumSynth {
         }
         out
     }
+}
+// Gain constants and operand order follow the OpenRB-338 GPL-3.0 reference.
+fn bank_trigger_gain(kit: usize, id: usize, level: f32, velocity: f32, pole: Option<f32>) -> f32 {
+    let mut raw = (level.clamp(0., 1.) * 127.).round() as u32;
+    if kit == 0 && id == 10 { raw /= 2; }
+    if kit == 0 && id == 11 { raw = 2 * raw / 3; }
+    let l = raw as f64;
+    let k = f32::from_bits(0x3c01_0204) as f64;
+    let velocity = velocity as f64;
+    let gain = if kit == 0 {
+        if (3..=5).contains(&id) { (((l * k) * l) * k) * velocity }
+        else if id == 2 { (((l * k) * l) * f32::from_bits(0x3ccc_cccd) as f64) * velocity }
+        else { (((k * l) * l) * f32::from_bits(0x3ba3_d70a) as f64) * velocity }
+    } else if id <= 2 {
+        ((l * (l * k)) * k) * velocity
+    } else {
+        let c = [0., 0., 0., 1.2_f32, 1.1, 1.4, 1.1, 2.3, 0.8, 1.1, 0.6, 0.6][id] as f64;
+        if (3..=5).contains(&id) || id >= 10 { ((l * (l * f32::from_bits(0x3882_0610) as f64)) * c) * velocity }
+        else { (((f32::from_bits(0x3882_0610) as f64 * l) * l) * c) * velocity }
+    };
+    (if id == 1 { gain * (1. - pole.unwrap_or(0.) as f64) } else { gain }) as f32
+}
+fn sample_voice(v: &mut SampleVoice, d: &rb_model::Drum, _kit: usize, _id: usize, sr: f32) -> Option<f32> {
+    if v.bank_ended { return None; }
+    let i = v.position as usize;
+    let len = v.noise.as_ref().map_or(v.sample.pcm.len(), |n| n.pcm.len().min(v.sample.pcm.len()));
+    let end = if v.bank_pitch.is_some() { (len + 63) / 64 * 64 } else { len };
+    if !v.bank_pitched && i >= end { return None; }
+    let read = |s: &rb_model::samples::CustomSample| {
+        let a = s.pcm.get(i).copied().unwrap_or(0) as i32;
+        let b = s.pcm.get(i + 1).copied().unwrap_or(0) as i32;
+        if v.bank_pitched && sr == 44100. && s.sample_rate == 44100 {
+            let frac = ((v.position - i as f64) * 256.) as i32;
+            (a + ((frac * (b - a)) >> 8)) as i16 as f64
+        } else { a as f64 + (b - a) as f64 * (v.position - i as f64) }
+    };
+    let out = if v.bank_pitch.is_some() {
+        let value = read(&v.sample);
+        let result = if let Some(noise) = &v.noise {
+            (value + read(noise) * v.bank_env) * v.bank_gain as f64
+        } else if let Some(original_pole) = v.filter_pole {
+            let pole = (original_pole as f64).powf(44100. / sr as f64);
+            let adaptation = (1. - pole) / (1. - original_pole as f64);
+            v.filter_state = v.filter_state * pole + value * v.bank_env * adaptation;
+            v.filter_state
+        } else { value * v.bank_env };
+        let previous = v.bank_clock;
+        v.bank_clock += 44100. / sr as f64;
+        let pairs = ((v.bank_clock - v.bank_hold).max(0.) / 2.).floor() - ((previous - v.bank_hold).max(0.) / 2.).floor();
+        v.bank_env *= (v.bank_fall as f64).powf(pairs);
+        if (v.bank_clock / 64.).floor() > (previous / 64.).floor() {
+            if !v.bank_pitched {
+                let gain = if v.noise.is_some() { v.bank_gain as f64 } else { v.bank_env };
+                if gain < f32::from_bits(0x3300_d959) as f64 { v.bank_ended = true; }
+            } else if v.position + v.bank_pitch.unwrap() * v.sample.sample_rate as f64 / sr as f64 > len as f64 { v.bank_ended = true; }
+            v.bank_env = v.bank_env as f32 as f64;
+            v.filter_state = v.filter_state as f32 as f64;
+        }
+        result as f32
+    } else {
+        let value = read(&v.sample) as f32 / 32768.;
+        let result = value * v.velocity * d.level.clamp(0., 1.5).powi(2) * v.env * 2.18;
+        let decay = d.decay.clamp(0.05, 2.);
+        v.env *= v.choke * (-((1. / decay - 1.).max(0.)) / sr).exp();
+        result
+    };
+    let step = v.bank_pitch.unwrap_or_else(|| 2f64.powf(d.tune.clamp(-24., 24.) as f64 / 12.));
+    v.position += v.sample.sample_rate as f64 / sr as f64 * step;
+    Some(out)
 }
 fn advance(v: &mut Voice) {
     if v.age >= v.hold {
@@ -552,7 +738,6 @@ fn kick_sample(v: &mut Voice, sr: f32) -> f32 {
     v.tone_state
 }
 fn voice_gain(kit: usize, id: usize, level: f32) -> f32 {
-    // Preserve the reference bus excitation before the rack's existing 2.18 normalization.
     let mut level = level.clamp(0., 1.5);
     if kit == 0 && (id == 10 || id == 11) {
         let raw = (level * 127.).round();
@@ -572,7 +757,7 @@ fn voice_gain(kit: usize, id: usize, level: f32) -> f32 {
             1.0999978, 0.5999988, 0.5999988,
         ][id]
     };
-    level * level * coefficient / 2.18
+    level * level * coefficient
 }
 fn lp(hz: f32, sr: f32) -> f32 {
     1. - (-TAU * hz.min(sr * 0.45) / sr).exp()
@@ -583,6 +768,15 @@ fn tone_alpha(tone: f32, sr: f32) -> f32 {
     1. - pole.powf(44100. / sr)
 }
 // Generated control curves, not waveform data. A multiplier acts once per sample pair.
+fn bank_decay(value: f32, kit: usize) -> f32 {
+    let index = ((((value - 0.3) / 1.7).clamp(0., 1.) * 16.) as usize).min(15);
+    if kit == 0 {
+        [0.999, 0.9993, 0.9995, 0.99955, 0.9996089, 0.9996524, 0.9996958, 0.9997393, 0.9997828, 0.99982, 0.99986, 0.999913, 0.99993, 0.999956, 0.99997, 1.][index]
+    } else {
+        let pole = (1.0_f64 - (15 - index) as f64 * 0.000025) as f32;
+        (pole as f64).powi(kit as i32) as f32
+    }
+}
 fn drum_decay(value: f32, sr: f32, kit: usize) -> f32 {
     let index = ((((value - 0.3) / 1.7).clamp(0., 1.) * 16.) as usize).min(15);
     let pole = if kit == 0 {
@@ -847,4 +1041,215 @@ mod render_measurements {
         let b: Vec<_> = (0..4800).map(|_| choked.sample(&kit)).collect();
         assert!(rms(&b[2400..]) < rms(&a[2400..]) * 0.15);
     }
+}
+
+#[cfg(test)]
+mod custom_sample_tests {
+    use super::*;
+    #[test]
+    fn sample_override_tune_retrigger_and_choke() {
+        let mut kit = rb_model::Song::default().drums[0].clone();
+        for d in &mut kit.voices { d.level=1.; d.tune=0.; d.decay=1.; }
+        let sample=std::sync::Arc::new(rb_model::samples::CustomSample {name:"test".into(), sample_rate:16000, pcm:vec![16384;8000]});
+        let mut d=DrumSynth::new(8000.,0);
+        d.trigger_sample(10,1.,&kit,Some(&sample));
+        assert!((d.sample(&kit)-0.5 * 2.18).abs()<1e-5);
+        for _ in 0..100 { d.sample(&kit); }
+        assert_eq!(d.samples[10].as_ref().unwrap().position,202.);
+        let before=d.samples[10].as_ref().unwrap().position;
+        kit.voices[10].tune=12.; d.sample(&kit);
+        assert_eq!(d.samples[10].as_ref().unwrap().position-before,4.);
+        d.trigger_sample(10,0.5,&kit,Some(&sample));
+        assert_eq!(d.samples[10].as_ref().unwrap().position,0.);
+        d.trigger_sample(11,1.,&kit,Some(&sample));
+        assert!(d.samples[10].as_ref().unwrap().choke<1.);
+        d.clear(); assert!(d.samples.iter().all(Option::is_none));
+        kit.voices[1].level=0.;
+        d.trigger_sample(1,1.,&kit,Some(&sample));
+        assert_eq!(d.sample(&kit),0.);
+        kit.voices[1].level=1.;
+        d.trigger_sample(1,1.,&kit,None);
+        assert!(d.samples[1].is_none());
+        assert!(d.voices[1].env>0.);
+
+    }
+    #[test]
+    fn bank_selectors_pitch_snare_and_manual_override() {
+        let mut kit = rb_model::Song::default().drums[0].clone();
+        let bank=std::sync::Arc::new(rb_model::samples::SampleBank {
+            name:"marker".into(), samples:(0..46).map(|id| Some(std::sync::Arc::new(rb_model::samples::CustomSample {
+                name:id.to_string(), sample_rate:44100, pcm:vec![id as i16 * 100;16],
+            }))).collect(),
+        });
+        let mut a=DrumSynth::new(44100.,0);
+        for (id,variant,expected) in [(3,false,18),(3,true,17),(4,false,21),(5,true,15),(6,false,23),(6,true,12),(7,false,13),(7,true,19),(8,false,10),(9,false,14),(10,false,22),(11,false,11)] {
+            kit.voices[id].variant=variant;
+            a.trigger_bank(id,1.,&kit,None,Some(&bank));
+            assert_eq!(a.samples[id].as_ref().unwrap().sample.name,expected.to_string());
+        }
+        kit.voices[2].tone=0.;
+        a.trigger_bank(2,1.,&kit,None,Some(&bank));
+        assert_eq!(a.samples[2].as_ref().unwrap().sample.name,"1");
+        assert_eq!(a.samples[2].as_ref().unwrap().noise.as_ref().unwrap().name,"7");
+        let mut b=DrumSynth::new(44100.,1);
+        kit.voices[1].tune=6.;
+        b.trigger_bank(1,1.,&kit,None,Some(&bank));
+        assert_eq!(b.samples[1].as_ref().unwrap().sample.name,"28");
+        kit.voices[2].tune=0.;
+        b.trigger_bank(2,1.,&kit,None,Some(&bank));
+        assert_eq!(b.samples[2].as_ref().unwrap().sample.name,"31");
+        assert_eq!(b.samples[2].as_ref().unwrap().noise.as_ref().unwrap().name,"35");
+        for id in 3..=11 {
+            b.trigger_bank(id,1.,&kit,None,Some(&bank));
+            assert_eq!(b.samples[id].as_ref().unwrap().sample.name,(34+id).to_string());
+        }
+        for (raw,expected) in [(64,256),(66,258),(90,290)] {
+            kit.voices[10].tune=raw as f32/127.*12.-6.;
+            b.trigger_bank(10,1.,&kit,None,Some(&bank));
+            assert_eq!((b.samples[10].as_ref().unwrap().bank_pitch.unwrap()*256.) as usize,expected);
+        }
+        let manual=std::sync::Arc::new(rb_model::samples::CustomSample {name:"manual".into(),sample_rate:8000,pcm:vec![1]});
+        b.trigger_bank(10,1.,&kit,Some(&manual),Some(&bank));
+        assert_eq!(b.samples[10].as_ref().unwrap().sample.name,"manual");
+        assert!(b.samples[10].as_ref().unwrap().bank_pitch.is_none());
+        let empty=std::sync::Arc::new(rb_model::samples::SampleBank {name:"empty".into(),samples:vec![None;46]});
+        b.trigger_bank(1,1.,&kit,None,Some(&empty));
+        assert!(b.samples[1].is_none());
+        assert!(b.voices[1].env>0.);
+    }
+
+    #[test]
+    fn imported_808_selector_flags_select_the_original_resources() {
+        let mut raw = include_bytes!("../../../songs/rbs-examples/Peff-3pm.rbs").to_vec();
+        let offset = raw.windows(4).position(|x|x==b"808 ").unwrap()+8;
+        let bank=std::sync::Arc::new(rb_model::samples::SampleBank {name:"markers".into(), samples:(0..46).map(|i|Some(std::sync::Arc::new(rb_model::samples::CustomSample {name:i.to_string(),sample_rate:44100,pcm:vec![0;64]}))).collect()});
+        for (control, voice, low, high) in [(11,3,17,18),(14,4,20,21),(17,5,15,16),(19,6,12,23),(21,7,19,13)] {
+            for (raw_value,expected) in [(0,low),(1,high)] {
+                raw[offset+control]=raw_value;
+                let song=rb_model::rbs::import(&raw).unwrap();
+                let mut d=DrumSynth::new(44100.,0);
+                d.trigger_bank(voice,1.,&song.drums[0],None,Some(&bank));
+                assert_eq!(d.samples[voice].as_ref().unwrap().sample.name,expected.to_string());
+            }
+        }
+    }
+    #[test]
+    fn bank_gain_filter_decay_snapshot_and_kick_tail() {
+        let bank = std::sync::Arc::new(rb_model::samples::SampleBank {
+            name: "constant".into(), samples: (0..46).map(|_| Some(std::sync::Arc::new(
+                rb_model::samples::CustomSample { name: "constant".into(), sample_rate: 44100, pcm: vec![16384; 30000] }
+            ))).collect(),
+        });
+        for k in 0..2 {
+            let mut kit = rb_model::Song::default().drums[k].clone();
+            kit.voices[1].level = 1.; kit.voices[1].decay = 0.3;
+            let mut a = DrumSynth::new(44100., k);
+            let mut b = DrumSynth::new(44100., k);
+            a.trigger_bank(1, 1., &kit, None, Some(&bank));
+            b.trigger_bank(1, 1., &kit, None, Some(&bank));
+            let first = a.sample(&kit);
+            assert!(first > 0. && first < 0.5 * voice_gain(k, 1, 1.));
+            assert_eq!(first, b.sample(&kit));
+            let mut changed = kit.clone(); changed.voices[1].level = 0.; changed.voices[1].decay = 2.; changed.voices[1].tone = 1.;
+            for _ in 0..256 { assert_eq!(a.sample(&kit), b.sample(&changed)); }
+            assert!(a.samples[1].as_ref().unwrap().bank_env < 1.);
+            a.trigger_bank(1, 1., &kit, None, Some(&bank));
+            assert!(a.bank_kick_tail.is_some());
+            let before = a.bank_kick_tail.as_ref().unwrap().bank_env;
+            for _ in 0..20 { a.sample(&kit); }
+            assert!(a.bank_kick_tail.as_ref().unwrap().bank_env < before);
+        }
+        let mut kit = rb_model::Song::default().drums[0].clone();
+        kit.voices[9].level = 1.; kit.voices[9].tone = 0.;
+        let mut cy = DrumSynth::new(44100., 0);
+        cy.trigger_bank(9, 1., &kit, None, Some(&bank));
+        assert!((cy.sample(&kit) - 0.5 * voice_gain(0, 9, 1.)).abs() < 1e-6);
+    }
+    #[test]
+    fn bank_filter_keeps_double_precision_and_pitched_uses_integer_interpolation() {
+        let mut bank = rb_model::samples::SampleBank { name: "numerics".into(), samples: vec![None; 46] };
+        bank.samples[14] = Some(std::sync::Arc::new(rb_model::samples::CustomSample { name: "filter".into(), sample_rate: 44100, pcm: vec![12345; 1024] }));
+        bank.samples[18] = Some(std::sync::Arc::new(rb_model::samples::CustomSample { name: "pitch".into(), sample_rate: 44100, pcm: vec![0, 1, 1, 1] }));
+        let bank = std::sync::Arc::new(bank);
+        let mut kit = rb_model::Song::default().drums[0].clone();
+        kit.voices[9].tone = 0.; kit.voices[9].decay = 2.;
+        let mut d = DrumSynth::new(44100., 0);
+        d.trigger_bank(9, 1., &kit, None, Some(&bank));
+        let v = d.samples[9].as_ref().unwrap();
+        let mut expected = 0_f64;
+        let gain = v.bank_gain as f64;
+        let pole = v.filter_pole.unwrap() as f64;
+        for _ in 0..63 {
+            expected = expected * pole + 12345. * gain;
+            assert_eq!(d.sample(&kit), expected as f32);
+        }
+        d.clear(); kit.voices[3].variant = false;
+        d.trigger_bank(3, 1., &kit, None, Some(&bank));
+        d.samples[3].as_mut().unwrap().position = 0.5;
+        assert_eq!(d.sample(&kit), 0.);
+    }
+    #[test]
+    fn bank_cymbal_filter_preserves_gain_across_sample_rates() {
+        let bank = std::sync::Arc::new(rb_model::samples::SampleBank {
+            name: "constant".into(), samples: (0..46).map(|_| Some(std::sync::Arc::new(
+                rb_model::samples::CustomSample { name: "constant".into(), sample_rate: 44100, pcm: vec![8192; 30000] }
+            ))).collect(),
+        });
+        let mut kit = rb_model::Song::default().drums[0].clone();
+        kit.voices[9].tone = 0.; kit.voices[9].decay = 2.; kit.voices[9].level = 1.;
+        let mut a = DrumSynth::new(44100., 0);
+        let mut b = DrumSynth::new(48000., 0);
+        a.trigger_bank(9, 1., &kit, None, Some(&bank));
+        b.trigger_bank(9, 1., &kit, None, Some(&bank));
+        let x = (0..4410).map(|_| a.sample(&kit)).last().unwrap();
+        let y = (0..4800).map(|_| b.sample(&kit)).last().unwrap();
+        assert!((x - y).abs() < x.abs() * 0.0001, "{x} {y}");
+    }
+    #[test]
+    fn bank_dual_noise_decays_and_hat_chokes() {
+        let bank = std::sync::Arc::new(rb_model::samples::SampleBank {
+            name: "constant".into(), samples: (0..46).map(|_| Some(std::sync::Arc::new(
+                rb_model::samples::CustomSample { name: "constant".into(), sample_rate: 44100, pcm: vec![8192; 30000] }
+            ))).collect(),
+        });
+        let mut kit = rb_model::Song::default().drums[1].clone();
+        kit.voices[2].tone = 0.; kit.voices[2].snappy = 1.; kit.voices[2].level = 1.;
+        let mut d = DrumSynth::new(44100., 1);
+        d.trigger_bank(2, 1., &kit, None, Some(&bank));
+        let initial = d.sample(&kit);
+        for _ in 0..4000 { d.sample(&kit); }
+        let later = d.sample(&kit);
+        assert!(later < initial && later > 0.25 * voice_gain(1, 2, 1.));
+        d.trigger_bank(9, 1., &kit, None, Some(&bank));
+        d.trigger_bank(8, 1., &kit, None, Some(&bank));
+        assert_eq!(d.samples[9].as_ref().unwrap().bank_fall, 0.996);
+        let mut high_rate = DrumSynth::new(48000., 1);
+        high_rate.trigger_bank(9, 1., &kit, None, Some(&bank));
+        high_rate.trigger_bank(8, 1., &kit, None, Some(&bank));
+        for _ in 0..480 { high_rate.sample(&kit); }
+        let open = high_rate.samples[9].as_ref().unwrap();
+        assert!((open.bank_clock - 441.).abs() < 0.001);
+        assert!((open.bank_env / open.bank_gain as f64 - (0.996_f32 as f64).powi(220)).abs() < 0.00001);
+    }
+    #[test]
+    fn mixed_bank_samples_finish_after_shorter_source() {
+        for (tone_len,noise_len) in [(4,8),(8,4)] {
+            let mut kit = rb_model::Song::default().drums[0].clone();
+            kit.voices[2].tone=0.; kit.voices[2].snappy=1.;
+            kit.voices[2].level=1.; kit.voices[2].decay=1.;
+            let mut bank=rb_model::samples::SampleBank { name:"test".into(), samples:vec![None;46] };
+            for (id,len) in [(1,tone_len),(7,noise_len)] {
+                bank.samples[id]=Some(std::sync::Arc::new(rb_model::samples::CustomSample {
+                    name:id.to_string(),sample_rate:44100,pcm:vec![8192;len],
+                }));
+            }
+            let bank=std::sync::Arc::new(bank);
+            let mut d=DrumSynth::new(44100.,0);
+            d.trigger_bank(2,1.,&kit,None,Some(&bank));
+            for i in 0..tone_len.min(noise_len) { assert!(d.sample(&kit)>0., "frame {i}, {tone_len}/{noise_len}"); }
+            for _ in tone_len.min(noise_len)..64 { d.sample(&kit); }
+            assert_eq!(d.sample(&kit),0.);
+        }
+    }
+
 }

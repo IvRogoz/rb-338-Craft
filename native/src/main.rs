@@ -5,12 +5,35 @@ mod controller;
 mod midi_decode;
 mod midi_device;
 mod platform;
+mod rbm;
+mod sample_banks;
 mod ui;
 mod wav;
 
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--render-song") {
+        let input = args.get(2).ok_or("usage: --render-song INPUT OUTPUT.wav")?;
+        let output = args.get(3).ok_or("usage: --render-song INPUT OUTPUT.wav")?;
+        let song = sample_banks::load_path(std::path::Path::new(input))?;
+        let resources = song
+            .loaded_bank
+            .as_ref()
+            .map_or(0, |b| b.samples.iter().flatten().count());
+        let bank = song.sample_bank.clone();
+        let mut export = wav::WavExport::new(song)?;
+        while !export.render_chunk(8192) {}
+        std::fs::write(output, export.finish()?)?;
+        std::fs::write(
+            format!("{output}.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "input":input,"bank":bank,"loaded_sample_resources":resources,"audio_device_opened":false
+            }))?,
+        )?;
+        return Ok(());
+    }
     if std::env::args().any(|arg| arg == "--self-test") {
         return self_test().map_err(Into::into);
     }

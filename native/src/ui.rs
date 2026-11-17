@@ -31,6 +31,8 @@ pub struct NativeApp {
     muted: bool,
     confirm_delete: bool,
     confirm_new: bool,
+    sample_kit: usize,
+    sample_voice: usize,
 }
 
 impl NativeApp {
@@ -87,6 +89,8 @@ impl NativeApp {
             muted: false,
             confirm_delete: false,
             confirm_new: false,
+            sample_kit: 0,
+            sample_voice: 1,
         }
     }
 
@@ -326,6 +330,54 @@ impl NativeApp {
                         self.confirm_delete = false;
                     }
                 });
+            }
+            ui.separator();
+            ui.label("CUSTOM SAMPLES · embedded in JSON song saves");
+            if let Some(bank) = &self.c.song.loaded_bank {
+                ui.label(format!("Sample bank: {} · {} resources loaded", bank.name,
+                    bank.samples.iter().flatten().count()));
+            }
+            ui.horizontal_wrapped(|ui| {
+                ComboBox::from_id_salt("sample-kit")
+                    .selected_text(if self.sample_kit == 0 { "808" } else { "909" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.sample_kit, 0, "808");
+                        ui.selectable_value(&mut self.sample_kit, 1, "909");
+                    });
+                let ids = if self.sample_kit == 0 { &rb_model::DRUM_IDS } else { &rb_model::DRUM_IDS_B };
+                ComboBox::from_id_salt("sample-voice")
+                    .selected_text(ids[self.sample_voice])
+                    .show_ui(ui, |ui| {
+                        for (voice, name) in ids.iter().enumerate().skip(1) {
+                            ui.selectable_value(&mut self.sample_voice, voice, *name);
+                        }
+                    });
+                if ui.button("LOAD WAV…").clicked() {
+                    match platform::open_sample_dialog() {
+                        Ok(Some(path)) => {
+                            self.c.status = self.c.load_sample_path(&path, self.sample_kit, self.sample_voice)
+                                .map(|_| "Sample assigned. Play its pattern or trigger the voice to hear it.".into())
+                                .unwrap_or_else(|error| format!("Sample import failed: {error}"));
+                        }
+                        Ok(None) => {}
+                        Err(error) => self.c.status = error,
+                    }
+                }
+                let has_sample = self.c.song.samples[self.sample_kit][self.sample_voice].is_some();
+                if ui.add_enabled(has_sample, Button::new("CLEAR SAMPLE")).clicked() {
+                    match self.c.song.clear_sample(self.sample_kit, self.sample_voice) {
+                        Ok(()) => { self.c.sync(); self.c.status = "Sample override cleared; bank or built-in voice restored.".into(); }
+                        Err(error) => self.c.status = error,
+                    }
+                }
+            });
+            if let Some(sample) = &self.c.song.samples[self.sample_kit][self.sample_voice] {
+                ui.label(format!("{} · {:.2} s · {} Hz", sample.name,
+                    sample.pcm.len() as f64 / sample.sample_rate as f64, sample.sample_rate));
+            } else if let Some(bank) = &self.c.song.loaded_bank {
+                ui.label(format!("Bank voice · {} · load a WAV to override this voice.", bank.name));
+            } else {
+                ui.label("Synthesized voice · load a mono or stereo WAV to replace it.");
             }
             ui.separator();
             for t in 0..4 {

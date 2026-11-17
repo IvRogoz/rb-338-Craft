@@ -257,41 +257,14 @@ pub struct Pcf {
     trigger: f64,
     env: f64,
     keep: f64,
+    take: f64,
     decay: f64,
     state: [f64; 2],
     mode: Option<bool>,
     coeff: [f32; 3],
-    tables: Vec<[[f32; 3]; 512]>,
 }
 impl Pcf {
     pub fn new(sr: f32) -> Self {
-        let mut tables = vec![[[0.; 3]; 512]; 16];
-        let k = f64::from_bits(0x3ff03b93e0000000);
-        let qbase = f64::from_bits(0x3ffc7ae140000000);
-        let pi = f64::from_bits(0x400921fb54524550);
-        for mode in 0..2 {
-            for r in 0..8 {
-                for i in 0..512 {
-                    let rf = r as f64;
-                    let fi = i as f64;
-                    let w = (k.powf(fi) * 0.4 / k.powf(511.))
-                        * (rf * (f32::from_bits(0x3e124925) as f64) * 0.4 + 0.6)
-                        * (44100. / sr as f64);
-                    let w = w.min(0.499);
-                    let q = (fi * fi / 128000. - 0.3).clamp(0., 1.);
-                    let d = q * (qbase.powf(rf) * 0.52) + (1. - q) * (rf / 6. + 0.5);
-                    let c0 = (-w * pi / d).exp() * (w * pi * 2.).cos() * 2.;
-                    let c1 = (-w * pi * 2. / d).exp();
-                    let num = if mode == 0 {
-                        (c1 + 1. - c0) * 2.
-                    } else {
-                        (w * pi).cos() * (1. - c0 + c1).sqrt() * 3.
-                    };
-                    let c2 = num / ((if d > 4. { 3. } else { d } + 1.) * 0.8);
-                    tables[mode * 8 + r][i] = [c0 as f32, c1 as f32, c2 as f32];
-                }
-            }
-        }
         Self {
             sr: sr as f64,
             clock: 0.,
@@ -303,11 +276,11 @@ impl Pcf {
             trigger: 0.,
             env: 0.,
             keep: 0.,
+            take: 1.,
             decay: 1.,
             state: [0.; 2],
             mode: None,
             coeff: [0.; 3],
-            tables,
         }
     }
     pub fn clear(&mut self) {
@@ -320,6 +293,7 @@ impl Pcf {
         self.trigger = 0.;
         self.env = 0.;
         self.keep = 0.;
+        self.take = 1.;
         self.decay = 1.;
         self.state = [0.; 2];
         self.mode = None;
@@ -330,6 +304,12 @@ impl Pcf {
     pub fn advance(&mut self, s: &Song) {
         while self.clock <= 0. {
             self.clock += 64.;
+            // The previous block's register values are stored as f32 before control runs.
+            self.trigger = self.trigger as f32 as f64;
+            self.env = self.env as f32 as f64;
+            self.state[0] = self.state[0] as f32 as f64;
+            self.state[1] = self.state[1] as f32 as f64;
+            self.take = 1. - self.keep;
             let freq =
                 (((s.fx.filter_cutoff - 100.) / 7900. * 127.).round() as i32).clamp(0, 127) as f64;
             let w = f64::from_bits(0x3fb015bf8c180485);
@@ -352,24 +332,30 @@ impl Pcf {
                 if v != 0 {
                     let amt = (s.fx.filter_amount * 127.).round().clamp(0., 127.) as u32;
                     self.trigger = (((v as u32 * amt) >> 5) as f64).min(511. - self.base as f64);
-                    self.keep = if v & 1 != 0 { 0.995_f32 as f64 } else { 0. };
+                    if v & 1 != 0 {
+                        self.keep = 0.995_f32 as f64;
+                        self.take = f32::from_bits(0x3ba3d700) as f64;
+                    } else {
+                        self.keep = 0.;
+                        self.take = 1.;
+                    }
                 }
             }
-            // Upstream stores intermediate state as f32 at each block boundary.
-            self.trigger = self.trigger as f32 as f64;
-            self.env = self.env as f32 as f64;
-            self.state[0] = self.state[0] as f32 as f64;
-            self.state[1] = self.state[1] as f32 as f64;
         }
         self.clock -= 44100. / self.sr;
         while self.group_clock <= 0. {
             self.group_clock += 4.;
             self.trigger *= self.decay;
-            self.env = self.env * self.keep + (self.trigger + self.base as f64) * (1. - self.keep);
+            self.env = self.env * self.keep + (self.trigger + self.base as f64) * self.take;
             let pos = self.env.clamp(0., 511.) as usize;
             let res = (((s.fx.filter_q - 0.5) / 14.5 * 127.).round() as usize).min(127);
             let mode = usize::from(s.fx.filter_mode == "BP");
-            self.coeff = self.tables[mode * 8 + (res * 8 / 128)][pos];
+            let table = include_bytes!("pcf_filter.bin");
+            let row = mode * 8 + res / 16;
+            self.coeff = std::array::from_fn(|i| {
+                let offset = ((row * 512 + pos) * 3 + i) * 4;
+                f32::from_le_bytes(table[offset..offset + 4].try_into().unwrap())
+            });
         }
         self.group_clock -= 44100. / self.sr;
     }
@@ -389,6 +375,25 @@ impl Pcf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capped_odd_trigger_matches_reference() {
+        let mut song = Song::default();
+        song.fx.filter_cutoff = 8000.; song.fx.filter_q = 14.5;
+        song.fx.filter_amount = 1.; song.fx.filter_decay = 0.1;
+        song.fx.filter_pattern = 22; song.fx.filter_mode = "LP".into();
+        let mut pcf = Pcf::new(44100.);
+        for block in 0..=14 {
+            pcf.tick(if block < 14 { 2 } else { 0 });
+            for i in 0..64 {
+                let x = (((block * 64 + i) as f32) * 0.037).sin() * 0.2;
+                pcf.advance(&song);
+                let y = pcf.sample(0, x, false);
+                if block == 14 && i == 63 { assert_eq!(y.to_bits(), 0x3ddcb564); }
+            }
+        }
+        assert_eq!((pcf.trigger as f32).to_bits(), 0x4382fe41);
+        assert_eq!((pcf.env as f32).to_bits(), 0x434e79fe);
+    }
     #[test]
     fn song_pattern_audio_matches_upstream_checkpoints() {
         // Captured from the pinned OpenRB PCF using identical input and controls.

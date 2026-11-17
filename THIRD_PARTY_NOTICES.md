@@ -1,9 +1,11 @@
 # Third-party notices
 
-The app synthesizes audio at runtime and redraws its interface. The runtime uses
-no original ReBirth recordings, sample banks, waveform ROM, image assets, or
-sprites. Original local audio resources were analyzed offline only; procedural
-parameters define the runtime oscillators, noise, and filter envelopes.
+Built-in sounds are synthesized at runtime, and the app redraws its interface.
+No recordings or waveform ROM are embedded in the default synthesis engine.
+The optional external [Trancer bank](native/Mods/README.md) supplies custom
+sample instruments for the native example song. Users may also load their own WAVs.
+Original local audio resources were analyzed offline; procedural parameters
+define the built-in oscillators, noise, and filter envelopes.
 
 ## Current software and dependency credits
 
@@ -17,6 +19,16 @@ algorithm and pattern data from
 [OpenRB-338](https://github.com/pingw33n/OpenRB-338/tree/cbca4492c0224dffaa477346bc8860559f3d853f),
 revision `cbca4492c0224dffaa477346bc8860559f3d853f`, under GPL-3.0-only.
 The license is retained in [licenses/OpenRB-338-GPL-3.0.txt](licenses/OpenRB-338-GPL-3.0.txt).
+
+Bank voice processing and resource selection in `crates/engine/src/drums.rs` and the native RBM
+decoder also adapt that pinned OpenRB-338 source under the same license.
+
+The TB-303 voice, 64-frame effects and mixer processing, and the generated
+filter, pitch and waveshaper table data in `crates/engine/src` also adapt that
+pinned OpenRB-338 revision under GPL-3.0-only. The reference comparison data
+used by tests is synthesized by that implementation; it contains no original
+recordings. The engine runs these algorithms at 44.1 kHz and converts the
+output rate for the audio device.
 
 The acid synthesis uses an analytic oscillator, a pre-filter, a resonant filter
 pair, and a DC blocker. Drum synthesis uses colored noise and damped-mode

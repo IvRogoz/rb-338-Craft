@@ -1,4 +1,4 @@
-//! Offline, sample-free WAV export of the selected song loop.
+//! Offline WAV export of the selected song loop.
 //! ReBirth's manual p. 142 directs users to include extra bars for delay tails;
 //! this exporter renders exactly the selected region and does not append tails.
 use rb_engine::Engine;
@@ -27,7 +27,10 @@ impl WavExport {
         if !frames_f64.is_finite() || frames_f64 < 1.0 {
             return Err("Invalid loop duration".into());
         }
-        let frames = frames_f64.round() as usize;
+        if frames_f64.ceil() > ((MAX_BYTES - 44) / 4) as f64 {
+            return Err("WAV export exceeds 256 MiB limit".into());
+        }
+        let frames = reference_frame_count(song.start, song.length, song.bpm);
         let data_bytes = frames.checked_mul(4).ok_or("Export size overflow")?;
         let total = data_bytes.checked_add(44).ok_or("Export size overflow")?;
         if total > MAX_BYTES || data_bytes > u32::MAX as usize - 36 {
@@ -55,6 +58,7 @@ impl WavExport {
         let mut engine = Engine::new(RATE as f32);
         engine.set_song(song);
         engine.command(2, start as u32);
+        engine.prepare_export();
         engine.command(1, 0);
         Ok(Self {
             engine,
@@ -71,7 +75,7 @@ impl WavExport {
             let n = todo.min(BLOCK);
             self.engine.render(&mut buffer[..n * 2]);
             for &x in &buffer[..n * 2] {
-                let sample = (x.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                let sample = rb_engine::pcm_i16(x);
                 self.output.extend_from_slice(&sample.to_le_bytes());
             }
             self.remaining -= n;
@@ -88,9 +92,32 @@ impl WavExport {
     }
 }
 
+// Follow the reference export driver's 2048-frame chunks and truncation.
+fn reference_frame_count(start: usize, length: usize, bpm: f32) -> usize {
+    let tempo = (bpm as f64 * 1000.).round();
+    let mut position = (start * 768) as f64;
+    let end = ((start + length) * 768) as f64;
+    let factor = 192. / 2_646_000_000.;
+    let mut total = 0;
+    loop {
+        let count = ((end - position) / (tempo * factor)) as i64;
+        let last = count < 2048;
+        let count = count.clamp(0,2048) as usize;
+        total += count;
+        position += (tempo * count as f64) * factor;
+        if last { return total; }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn loop_length_matches_reference_chunk_truncation() {
+        for (start,length,bpm,expected) in [(0,1,138.,76695),(0,113,138.,8666608),(0,215,138.,16489565),(0,1,500.,21167),(1,1,500.,21168)] {
+            assert_eq!(reference_frame_count(start,length,bpm),expected);
+        }
+    }
     #[test]
     fn header_duration_and_nonzero_audio() {
         let mut s = Song::default();

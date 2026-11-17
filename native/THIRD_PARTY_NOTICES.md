@@ -1,7 +1,9 @@
 # Third-party notices
 
-The app synthesizes audio at runtime and redraws its interface. The runtime uses
-no original ReBirth recordings, sample banks, image assets, or sprites.
+Built-in sounds are synthesized at runtime, and the app redraws its interface.
+No recordings are embedded in the default synthesis engine. The optional
+external [Trancer bank](Mods/README.md) supplies custom sample instruments;
+its source and retained credits are documented there. Users may also load WAVs.
 
 ## Current software, native interface, and fallback fonts
 
@@ -21,6 +23,18 @@ algorithm and pattern data from
 [OpenRB-338](https://github.com/pingw33n/OpenRB-338/tree/cbca4492c0224dffaa477346bc8860559f3d853f),
 revision `cbca4492c0224dffaa477346bc8860559f3d853f`, under GPL-3.0-only.
 The license is retained in [licenses/OpenRB-338-GPL-3.0.txt](licenses/OpenRB-338-GPL-3.0.txt).
+
+The RBM decoder in `src/rbm.rs`, its embedded compatibility key window, and
+bank voice processing and resource selection in `crates/engine/src/drums.rs` also adapt that pinned
+OpenRB-338 source under the same license. No audio samples are embedded in the
+executable; optional bank data is kept in the separate `Mods` folder.
+
+The TB-303 voice, 64-frame effects and mixer processing, and the generated
+filter, pitch and waveshaper table data in `crates/engine/src` also adapt that
+pinned OpenRB-338 revision under GPL-3.0-only. The reference comparison data
+used by tests is synthesized by that implementation; it contains no original
+recordings. The engine runs these algorithms at 44.1 kHz and converts the
+output rate for the audio device.
 
 The frequency-compensated filter coefficients and resonance control mapping in
 `crates/engine/src/acid.rs` adapt Open303's design.

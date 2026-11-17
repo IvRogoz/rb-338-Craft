@@ -2,7 +2,7 @@
 
 A Rust music workstation with the ReBirth RB-338 rack: two 303-style bass synthesizers, 808-style and 909-style drum machines, pattern sequencing, and effects. This repository contains a browser version and a separate native Windows application.
 
-The Windows version runs directly as an executable with native rendering, audio, MIDI, and file access. The browser version runs the Rust engine as WebAssembly inside an AudioWorklet, with small JavaScript adapters for browser audio and MIDI APIs. All sound is synthesized at runtime without recorded samples or waveform ROMs.
+The Windows version runs directly as an executable with native rendering, audio, MIDI, and file access. The browser version runs the Rust engine as WebAssembly inside an AudioWorklet, with small JavaScript adapters for browser audio and MIDI APIs. Built-in voices are synthesized at runtime; individual 808 and 909 voices can also play user-loaded WAV samples.
 
 ![RB-338 Craft showing the current rack, top Song / File launcher, synths, drum machines, mixers, and effects](app-screenshot.png)
 
@@ -34,6 +34,7 @@ Native-window appearance, interactive controls, file dialogs, and physical MIDI 
 - Section mixers with level, pan, mute, delay sends, and insert routing.
 - Distortion, a pattern-controlled filter (PCF), compression, and tempo-synchronized delay.
 - Named song saves, JSON import/export, and original ReBirth `.rbs` import.
+- Per-voice custom WAV samples, embedded in JSON song saves and included in WAV exports.
 - Stereo WAV loop export and MIDI input with optional clock/transport sync.
 
 Both versions use a proportionally scaled rack and a top **SONG / FILE · LIBRARY** modal for song files, arrangements, MIDI, and supplementary controls. The web interface uses HTML/CSS; the native interface uses Rust drawing.
@@ -104,6 +105,19 @@ The modal also contains pattern and measure utilities, scene selection, Vintage,
 
 Browser saves belong to the browser and origin, including the port. Download JSON files for portable backups. Legacy `rb338:` saves are supported. Example `.rbs` files are in [`songs/rbs-examples/`](songs/rbs-examples/); see the [example song notes](songs/rbs-examples/README.md).
 
+In **SONG / FILE · LIBRARY → CUSTOM SAMPLES**, choose 808 or 909 and a voice,
+then load a WAV. The sample replaces that voice across its patterns and uses
+its level, tune, accent, mixer, and effects settings. **CLEAR SAMPLE** restores
+the bank or synthesized voice on its next trigger. Loading a sample does not start playback.
+Mono and stereo PCM 8/16/24/32-bit and float32 WAV files at 8–192 kHz are supported;
+stereo is mixed to mono and stored as 16-bit PCM. A song can contain up to
+2,000,000 sample frames in total (about 45.4 seconds at 44.1 kHz), including bank audio.
+Samples travel inside saved/downloaded JSON; browser storage quotas may require
+downloading JSON instead of a named browser save. The native version also
+automatically resolves the `.rbm` bank named by imported RBS songs; see the
+[native bank instructions](native/Mods/README.md). Browser imports can play
+banks embedded in JSON saves from the native app.
+
 WAV export renders exactly the selected loop and does not append delay tails. Include extra bars when needed. Exports are limited to 256 MiB.
 
 MIDI requires browser Web MIDI support and device permission. Choose a device or **ALL INPUTS**, then select a channel. Notes, mapped controller messages, and optional clock/transport synchronization are supported.
@@ -153,7 +167,14 @@ Tests cover import validation, patterns and transport, arrangements and automati
 
 ## Sound fidelity and credits
 
-This Rust reimplementation synthesizes audio procedurally. The 303 uses analytic saw and asymmetric square waves, a pre-pole, resonant two-pole filter and DC blocker, with envelope, accent, Vintage and control behavior. Drums use analytic kick sweeps, damped multimode resonances, colored noise and cowbell pulses. The 909 Tune control selects the sweep without transposing its 54 Hz tail; controls, hat choke and source gains were corrected. Weak and strong 909 flams use values 3 and 4 with tempo-dependent timing and strengths, supported by both interfaces. There are no runtime recordings, sample banks, waveform ROMs or circuit solver. The production engine changed; the WAV-export wrapper did not. Both engine source copies contain these changes.
+The 303, distortion, compression, delay and mixer use the pinned OpenRB-338
+processing rules and generated coefficient tables, with a 44.1 kHz core and
+64-frame sequencing blocks. Audio is converted to the output device's rate.
+Factory drum voices remain procedural; loaded sample banks use the reference
+voice gains, filters, envelopes and sample selectors. User WAV assignments
+remain optional. RBS import preserves note octaves, per-pattern shuffle and
+instrument controls. WAV export uses the reference PCM conversion and chunk
+truncation rules. Both engine source copies contain these changes.
 
 On 2026-11-10, isolated harness checks passed for each root and native source copy: 47 engine, 23 model and 3 actual WAV-export tests. The full web and native workspaces also passed 84 and 85 tests respectively, with documentation checks passing. Both runnable applications were rebuilt with Rust 1.94.0 and their locked dependencies in a project-private build environment. All 145 diagnostic and 11 application references were rendered through the production web `WavExport` as 44.1 kHz, 16-bit PCM, using [pingw33n/OpenRB-338](https://github.com/pingw33n/openrb-338/tree/main), revision `cbca4492c0224dffaa477346bc8860559f3d853f`. The baseline is commit `a8b656e`. Lower errors are better; these measures are not percentages of audible similarity.
 

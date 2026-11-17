@@ -206,8 +206,8 @@ pub fn synth(app: &mut NativeApp, ui: &mut egui::Ui, r: Rect, t: usize) {
                 ui.painter()
                     .rect_filled(key, 1., Color32::from_rgb(16, 25, 20));
             }
-            let selected = (i < 12 && note.note % 12 == i as u8 && !(i == 0 && note.note >= 48))
-                || (i == 12 && note.note % 12 == 0 && note.note >= 48);
+            let selected = (i < 12 && note.note % 12 == i as u8 && !(i == 0 && note.note >= 60))
+                || (i == 12 && note.note % 12 == 0 && note.note >= 60);
             let light_y = if sharp {
                 key.top() + 4.
             } else {
@@ -272,8 +272,8 @@ pub fn synth(app: &mut NativeApp, ui: &mut egui::Ui, r: Rect, t: usize) {
         false,
     );
     for (i, (title, key, on)) in [
-        ("DOWN", "down", note.note < 36),
-        ("UP", "up", note.note >= 48),
+        ("DOWN", "down", note.note < 48),
+        ("UP", "up", note.note >= 60),
         ("ACCENT", "accent", note.accent),
         ("SLIDE", "slide", note.slide),
     ]
@@ -318,7 +318,7 @@ fn fields(k: usize, i: usize) -> &'static [Field] {
     if k == 0 {
         match i {
             1 | 9 => &[LEVEL, TONE, DECAY],
-            2 => &[LEVEL, ("TONE", "tune", -6., 6.), SNAPPY],
+            2 => &[LEVEL, TONE, SNAPPY],
             3..=5 => &[LEVEL, TUNE],
             10 => &[LEVEL, DECAY],
             _ => &[LEVEL],

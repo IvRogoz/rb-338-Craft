@@ -1,4 +1,4 @@
-//! Sample-free Rust synthesis and musical sequencing, without circuit simulation.
+//! Rust synthesis, sample playback and reference block sequencing.
 use rb_model::{Automation, Song};
 use std::collections::HashSet;
 mod acid;
@@ -6,11 +6,27 @@ mod drums;
 mod fx;
 use acid::AcidVoice;
 use drums::DrumSynth;
+/// The reference output conversion scales in f64 and truncates after clipping.
+pub fn pcm_i16(sample: f32) -> i16 {
+    let x = sample as f64 * 32768.;
+    if x.is_nan() { i16::MIN } else { x.clamp(-32768.,32767.) as i16 }
+}
+
 
 pub struct Engine {
     song: Song,
     current: Song,
     sr: f32,
+    sequence_pos: f64,
+    sequence_origin: usize,
+    sequence_last: i32,
+    gate_off: [i32; 2],
+    core_output: [[f32; 2]; 64],
+    core_offset: usize,
+    output_phase: f64,
+    output_previous: [f32; 2],
+    output_next: [f32; 2],
+    output_ready: bool,
     playing: bool,
     recording: bool,
     midi_sync: bool,
@@ -24,6 +40,11 @@ pub struct Engine {
     track_time: [f64; 4],
     track_step: [usize; 4],
     track_count: [usize; 4],
+    pattern_start: [i32; 4],
+    last_pattern_pos: [i32; 4],
+    last_note_step: [i32; 4],
+    pattern_wrapped: [bool; 4],
+    latched_enabled: [bool; 4],
     active_slots: [usize; 4],
     auto_cursor: usize,
     manual: HashSet<(u8, u8)>,
@@ -56,13 +77,16 @@ impl Engine {
             48000.
         };
         let song = Song::default();
-        let mut rack = fx::Rack::new(sr);
+        let mut rack = fx::Rack::new(44100.);
         rack.configure(&song);
         Self {
             current: song.clone(),
             active_slots: song.slots,
             song,
             sr,
+            sequence_pos: 0., sequence_origin: 0, sequence_last: 0,
+            gate_off: [-1; 2], core_output: [[0.; 2]; 64], core_offset: 64,
+            output_phase: 0., output_previous: [0.; 2], output_next: [0.; 2], output_ready: false,
             playing: false,
             recording: false,
             midi_sync: false,
@@ -76,12 +100,14 @@ impl Engine {
             track_time: [0.; 4],
             track_step: [0; 4],
             track_count: [0; 4],
+            pattern_start: [0;4], last_pattern_pos: [0;4], last_note_step: [0;4],
+            pattern_wrapped: [true;4], latched_enabled: [true;4],
             auto_cursor: 0,
             manual: HashSet::new(),
             manual_paths: HashSet::new(),
             controls_revision: 1,
-            voices: std::array::from_fn(|_| AcidVoice::new(sr)),
-            drums: std::array::from_fn(|k| DrumSynth::new(sr, k)),
+            voices: std::array::from_fn(|_| AcidVoice::new(44100.)),
+            drums: std::array::from_fn(|k| DrumSynth::new(44100., k)),
             flams: [[[0.; 16]; 12]; 2],
             flam_gain: [[[0.; 16]; 12]; 2],
             rack,
@@ -91,6 +117,15 @@ impl Engine {
         }
     }
     pub fn set_song(&mut self, song: Song) {
+        let old_tempo = (self.current.bpm as f64 * 1000.).round();
+        let new_tempo = (song.bpm as f64 * 1000.).round();
+        if !self.midi_sync && old_tempo != new_tempo {
+            // Keep scheduled boundaries at the same PPQN position when tempo changes.
+            let scale = old_tempo / new_tempo;
+            self.time *= scale;
+            self.next_half *= scale;
+            for clock in &mut self.track_time { *clock *= scale; }
+        }
         if self.playing && !song.automation.is_empty() {
             let mut edited = HashSet::new();
             different_paths(
@@ -130,6 +165,12 @@ impl Engine {
             self.active_slots = self.desired_slots();
         }
         self.rack.configure(&self.current);
+    }
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn set_song_preserving_samples(&mut self, mut song: Song) {
+        song.samples = self.song.samples.clone();
+        song.loaded_bank = self.song.loaded_bank.clone();
+        self.set_song(song);
     }
     fn desired_slots(&self) -> [usize; 4] {
         if self.current.song_mode {
@@ -176,7 +217,7 @@ impl Engine {
         self.auto_cursor = 0;
         if self.song.song_mode {
             while self.auto_cursor < self.song.automation.len()
-                && (self.song.automation[self.auto_cursor].tick as usize) < tick
+                && (self.song.automation[self.auto_cursor].tick as usize) <= tick
             {
                 let e = &self.song.automation[self.auto_cursor];
                 if !self.manual.contains(&(e.track, e.controller)) {
@@ -212,7 +253,7 @@ impl Engine {
     }
     fn clear_sound(&mut self, echo: bool) {
         for voice in &mut self.voices {
-            voice.clear();
+            voice.silence();
         }
         for kit in &mut self.drums {
             kit.clear();
@@ -220,6 +261,9 @@ impl Engine {
         self.flams = [[[0.; 16]; 12]; 2];
         self.flam_gain = [[[0.; 16]; 12]; 2];
         self.click = 0.;
+        self.gate_off = [-1; 2];
+        self.core_offset = 64;
+        self.output_ready = false;
         self.rack.clear(echo);
         self.rack.configure(&self.current);
     }
@@ -228,12 +272,16 @@ impl Engine {
         self.half = 0;
         self.step = 0;
         self.time = 0.;
+        self.sequence_pos = 0.; self.sequence_origin = self.bar * 768; self.sequence_last = 0;
         self.next_half = 0.;
         self.track_time = [0.; 4];
         self.track_step = [0; 4];
         self.track_count = [0; 4];
         self.restore_automation(self.bar * 32);
         self.active_slots = self.desired_slots();
+        self.pattern_start = [self.sequence_origin as i32;4];
+        self.last_pattern_pos = [0;4]; self.last_note_step = [0;4]; self.pattern_wrapped = [true;4];
+        self.latched_enabled = self.current.enabled;
         self.clear_sound(true);
     }
     /// 0 Stop (echo tails retained), 1 Continue, 2 Seek bar, 3 audition,
@@ -267,7 +315,7 @@ impl Engine {
                 let k = (value / 16) as usize;
                 let id = (value % 16) as usize;
                 if k < 2 && id > 0 && id < 12 {
-                    self.drums[k].trigger(id, 1., &self.current.drums[k]);
+                    self.drums[k].trigger_bank(id, 1., &self.current.drums[k], self.current.samples[k][id].as_ref(), self.current.loaded_bank.as_ref());
                 }
             }
             4 => self.metronome = value != 0,
@@ -276,6 +324,7 @@ impl Engine {
                 self.manual.clear();
                 self.manual_paths.clear();
                 self.seek(self.song.start);
+                for voice in &mut self.voices { voice.clear(); }
             }
             6 => {
                 self.recording = value != 0;
@@ -324,6 +373,12 @@ impl Engine {
         }
         self.midi_seen = true;
         self.midi_elapsed = 0.;
+        self.sequence_pos = self.time * 120. * 192. / 60.;
+        for track in 0..2 {
+            if self.gate_off[track] >= 0 && self.track_tick(track) >= self.gate_off[track] {
+                self.voices[track].gate_off(); self.gate_off[track] = -1;
+            }
+        }
         self.advance_boundaries();
         if self.playing {
             self.time += 60. / 120. / 24.;
@@ -378,9 +433,9 @@ impl Engine {
         }
         if self.playing {
             for t in 0..4 {
-                while self.time + 1e-10 >= self.track_time[t] {
-                    self.track_boundary(t);
-                }
+                if self.midi_sync {
+                    while self.time + 1e-10 >= self.track_time[t] { self.track_boundary(t); }
+                } else { self.reference_step(t); }
             }
         }
     }
@@ -406,6 +461,12 @@ impl Engine {
                     .min(self.song.arrangement.len());
                 if self.song.looping && self.bar == end {
                     self.bar = self.song.start;
+                    let seconds = self.song.length as f64 * 240. / self.current.bpm as f64;
+                    self.time -= seconds; self.next_half -= seconds;
+                    self.sequence_pos -= (self.song.length*768) as f64;
+                    for clock in &mut self.track_time {*clock -= seconds;}
+                    self.pattern_start = [(self.song.start*768) as i32;4];
+                    self.last_pattern_pos = [0;4]; self.pattern_wrapped = [true;4]; self.gate_off = [-1;2];
                     self.restore_automation(self.bar * 32);
                 }
                 if self.bar >= self.song.arrangement.len() {
@@ -455,68 +516,12 @@ impl Engine {
         }
         let slot = self.active_slots[t];
         let i = self.track_step[t];
-        let swing = if self.current.shuffle_tracks[t] {
-            self.current.shuffle / 100. * 0.9
-        } else {
-            0.
-        };
-        let duration = 60. / self.current.bpm / 4.
-            * if self.track_count[t] % 2 == 0 {
-                1. + swing
-            } else {
-                1. - swing
-            };
-        if t == 3 { self.flams[1] = [[0.;16];12]; self.flam_gain[1] = [[0.;16];12]; }
-        if self.current.enabled[t] {
-            if t < 2 {
-                self.voices[t].note(
-                    &self.current.patterns[slot].notes[t][i],
-                    &self.current.synth[t],
-                    duration,
-                    self.current.vintage,
-                );
-            } else {
-                let k = t - 2;
-                let p = &self.current.patterns[slot];
-                let accent = 1. + p.drums[k][0][i] as f32
-                    * self.current.drums[k].voices[0].level * 127. / 32.;
-                // The 909 triggers high instrument columns first, including OH before CH.
-                for order in 1..12 {
-                    let id = if k == 1 { 12-order } else { order };
-                    let v = p.drums[k][id][i];
-                    if v > 0 {
-                        let gain = accent * if k == 0 { 1. }
-                            else if v == 2 || v == 4 { 2. } else { 0.8 };
-                        self.drums[k].trigger(id, gain, &self.current.drums[k]);
-                        if v >= 3 {
-                            if let Some(index) = self.flams[k][id].iter().position(|time| *time <= 0.) {
-                                let quantum = self.sr * 64. / 44100.;
-                                let interval = if k == 1 {
-                                    let raw = rb_model::rbs::flam_control(self.current.drums[k].flam);
-                                    rb_model::rbs::flam_seconds(raw,self.current.bpm)*self.sr
-                                } else { self.current.drums[k].flam*self.sr };
-                                self.flams[k][id][index] = if k == 1 {
-                                    (interval/quantum).ceil()*quantum + 1.
-                                } else { interval };
-                                self.flam_gain[k][id][index] = if k == 1 { accent*1.5 } else { gain*0.85 };
-                            }
-                        }
-                    }
-                }
-            }
-        } else if t < 2 {
-            self.voices[t].note(
-                &rb_model::Note {
-                    note: 36,
-                    gate: false,
-                    accent: false,
-                    slide: false,
-                },
-                &self.current.synth[t],
-                duration,
-                self.current.vintage,
-            );
-        }
+        let raw_shuffle = (self.current.shuffle / 60. * 127.).round().clamp(0.,127.) as u8;
+        let swing = if self.current.shuffle_for(self.active_slots[t],t) { (raw_shuffle / 6) as f64 / 48. } else { 0. };
+        let base_duration = 60. / self.current.bpm as f64 / 4.;
+        let duration = base_duration * if self.track_count[t] % 2 == 0 { 1. + swing } else { 1. - swing };
+        self.trigger_track(t, slot, i, self.current.enabled[t]);
+        if t < 2 {self.gate_off[t] = self.track_tick(t)+24;}
         self.track_step[t] += 1;
         self.track_count[t] += 1;
         self.track_time[t] += if self.midi_sync {
@@ -527,49 +532,156 @@ impl Engine {
                     1. - swing as f64
                 }
         } else {
-            duration as f64
+            duration
         };
     }
-    pub fn render(&mut self, out: &mut [f32]) {
-        self.rack.metrics = [0.; 11];
-        let dt = 1. / self.sr as f64;
-        for frame in out.chunks_exact_mut(2) {
-            if self.midi_sync {
-                self.midi_elapsed += dt;
-            }
-            if self.playing && !self.midi_sync {
-                self.advance_boundaries();
-                self.time += dt;
-            }
-            let mut ch = [0.; 4];
-            for i in 0..2 {
-                ch[i] = self.voices[i].sample(&self.current.synth[i]);
-            }
-            for k in 0..2 {
+    fn trigger_track(&mut self, t: usize, slot: usize, i: usize, enabled: bool) {
+        if t == 3 { self.flams[1] = [[0.;16];12]; self.flam_gain[1] = [[0.;16];12]; }
+        if enabled {
+            if t < 2 {
+                self.voices[t].note_block(
+                    &self.current.patterns[slot].notes[t][i],
+                    &self.current.synth[t], self.current.vintage,
+                );
+
+            } else {
+                let k = t - 2;
+                let p = &self.current.patterns[slot];
+                let accent_byte = (self.current.drums[k].voices[0].level * 127.).round();
+                let accent = ((p.drums[k][0][i] as f64 * accent_byte as f64) * 0.03125 + 1.) as f32;
+                // The 909 triggers high instrument columns first, including OH before CH.
                 for order in 1..12 {
-                    let id = if k == 1 {12-order} else {order};
-                    for index in 0..16 {
-                        if self.flams[k][id][index] > 0. {
-                            self.flams[k][id][index] -= 1.;
-                            if self.flams[k][id][index] <= 0. {
-                                self.drums[k].trigger(
-                                    id,
-                                    self.flam_gain[k][id][index],
-                                    &self.current.drums[k],
-                                );
+                    let id = if k == 1 { 12-order } else { order };
+                    let v = p.drums[k][id][i];
+                    if v > 0 {
+                        let gain = (accent as f64 * if k == 0 { 1. }
+                            else if v == 2 || v == 4 { 2. } else { 0.8 }) as f32;
+                        self.drums[k].trigger_bank(id, gain, &self.current.drums[k], self.current.samples[k][id].as_ref(), self.current.loaded_bank.as_ref());
+                        if v >= 3 {
+                            if let Some(index) = self.flams[k][id].iter().position(|time| *time <= 0.) {
+                                let quantum = 64.;
+                                let interval = if k == 1 {
+                                    let raw = rb_model::rbs::flam_control(self.current.drums[k].flam);
+                                    rb_model::rbs::flam_seconds(raw,self.current.bpm)*44100.
+                                } else { self.current.drums[k].flam*44100. };
+                                self.flams[k][id][index] = if k == 1 {
+                                    (interval/quantum).ceil()*quantum + 1.
+                                } else { interval };
+                                self.flam_gain[k][id][index] = if k == 1 { accent*1.5 } else { gain*0.85 };
                             }
                         }
                     }
                 }
-                ch[k + 2] = self.drums[k].sample(&self.current.drums[k]);
             }
-            self.click_phase = (self.click_phase + 1800. / self.sr).fract();
-            let click = (self.click_phase * std::f32::consts::TAU).sin() * self.click * 0.08;
-            self.click *= 0.99;
-            let samples = self.rack.sample(ch, &self.current, click);
-            frame.copy_from_slice(&samples);
+        } else if t < 2 {
+            self.voices[t].silence();
+
         }
     }
+    fn reference_step(&mut self, t: usize) {
+        let tick = self.sequence_origin as i32 + self.sequence_pos as i32;
+        let musical = self.track_tick(t);
+        let old = self.active_slots[t];
+        let period = 48 * self.current.patterns[old].lengths[t] as u32;
+        let pos = (musical.wrapping_sub(self.pattern_start[t]) as u32 % period) as i32;
+        if self.last_pattern_pos[t].wrapping_sub(pos) > 24 {
+            if t < 2 && self.gate_off[t] >= 0 {self.voices[t].gate_off(); self.gate_off[t] = -1;}
+            self.pattern_wrapped[t] = true;
+        }
+        self.last_pattern_pos[t] = pos;
+        let step = (pos / 48) as usize;
+        if t < 2 && self.gate_off[t] >= 0 {
+            if !self.latched_enabled[t] {self.voices[t].silence();}
+            if pos >= self.gate_off[t] {self.voices[t].gate_off(); self.gate_off[t] = -1;}
+            return;
+        }
+        if step as i32 == self.last_note_step[t] && !self.pattern_wrapped[t] {return;}
+        if t < 2 {self.gate_off[t] = pos + 24;}
+        self.pattern_wrapped[t] = false;
+        // The original latches pending patterns and enable state at a global bar line,
+        // including when the current pattern has a non-sixteen-step length.
+        if (tick / 48) & 15 == 0 {
+            let desired = self.desired_slots()[t];
+            if desired != old {self.active_slots[t] = desired; self.pattern_start[t] = 768*(tick/768);}
+            self.latched_enabled[t] = self.current.enabled[t];
+        }
+        self.trigger_track(t, self.active_slots[t], step, self.latched_enabled[t]);
+        self.last_note_step[t] = step as i32;
+        self.track_step[t] = step+1; self.track_count[t] += 1;
+    }
+    fn track_tick(&self, track: usize) -> i32 {
+        let tick = self.sequence_origin as i32 + self.sequence_pos as i32;
+        if self.current.shuffle_for(self.active_slots[track],track) {
+            let raw = (self.current.shuffle / 60. * 127.).round().clamp(0.,127.) as i32;
+            96 * (tick / 96) + (tick % 96 - raw / 6).max(0)
+        } else { tick }
+    }
+    fn core_frame(&mut self) -> [f32; 2] {
+        if self.core_offset == 64 {
+            self.rack.begin_block(&self.current);
+            if self.playing && !self.midi_sync {
+                // OpenRB advances its 192-PPQN position before each 64-frame block.
+                let tempo = (self.current.bpm as f64 * 1000.).round();
+                self.sequence_pos += tempo * f64::from_bits(0x3ed3_7a72_81b2_2126);
+                let tick = self.sequence_pos as i32;
+                self.time = self.sequence_pos * 60_000. / (tempo * 192.);
+                if tick > self.sequence_last {
+                    self.advance_boundaries();
+                }
+                self.sequence_last = self.sequence_pos as i32;
+            }
+            let mut channels = [[0.;4];64];
+            let mut clicks = [0.;64];
+            for frame in 0..64 {
+                if self.midi_sync { self.midi_elapsed += 1. / 44100.; }
+                for i in 0..2 { channels[frame][i] = self.voices[i].sample(&self.current.synth[i]); }
+                for k in 0..2 {
+                    for order in 1..12 {
+                        let id = if k == 1 {12-order} else {order};
+                        for index in 0..16 {
+                            if self.flams[k][id][index] > 0. {
+                                self.flams[k][id][index] -= 1.;
+                                if self.flams[k][id][index] <= 0. {
+                                    self.drums[k].trigger_bank(id,self.flam_gain[k][id][index],&self.current.drums[k],
+                                        self.current.samples[k][id].as_ref(),self.current.loaded_bank.as_ref());
+                                }
+                            }
+                        }
+                    }
+                    channels[frame][k+2] = self.drums[k].sample(&self.current.drums[k]);
+                }
+                self.click_phase = (self.click_phase + 1800. / 44100.).fract();
+                clicks[frame] = (self.click_phase * std::f32::consts::TAU).sin() * self.click * 0.08;
+                self.click *= 0.99;
+            }
+            self.core_output = self.rack.process_block(&channels, &self.current, &clicks);
+            self.core_offset = 0;
+        }
+        let out = self.core_output[self.core_offset]; self.core_offset += 1; out
+    }
+    /// Render the same 44.1-kHz block engine for export and every output device rate.
+    pub fn render(&mut self, out: &mut [f32]) {
+        self.rack.metrics = [0.;11];
+        for frame in out.chunks_exact_mut(2) {
+            if self.sr == 44100. { frame.copy_from_slice(&self.core_frame()); continue; }
+            if !self.output_ready {
+                self.output_previous = self.core_frame(); self.output_next = self.core_frame();
+                self.output_phase = 0.; self.output_ready = true;
+            }
+            let part = self.output_phase as f32;
+            for i in 0..2 {frame[i] = self.output_previous[i] + (self.output_next[i]-self.output_previous[i])*part;}
+            self.output_phase += 44100. / self.sr as f64;
+            while self.output_phase >= 1. {
+                self.output_previous = self.output_next; self.output_next = self.core_frame(); self.output_phase -= 1.;
+            }
+        }
+    }
+    /// Canonical stopped warm-up used by the reference export driver.
+    pub fn prepare_export(&mut self) {
+        for _ in 0..9088*64 { self.core_frame(); }
+        self.output_ready = false;
+    }
+
 }
 
 fn automation_paths(template: &Song, track: u8, controller: u8) -> HashSet<String> {
@@ -677,8 +789,7 @@ mod abi {
     pub extern "C" fn rb_input_capacity() -> usize {
         INPUT_CAP
     }
-    #[no_mangle]
-    pub extern "C" fn rb_set_song(len: usize) -> i32 {
+    fn set_song_from_input(len: usize, preserve_samples: bool) -> i32 {
         if len > INPUT_CAP {
             return -1;
         }
@@ -689,7 +800,11 @@ mod abi {
             if let Ok(song) = Song::from_json(text) {
                 return ENGINE.with(|e| {
                     if let Some(engine) = e.borrow_mut().as_mut() {
-                        engine.set_song(song);
+                        if preserve_samples {
+                            engine.set_song_preserving_samples(song);
+                        } else {
+                            engine.set_song(song);
+                        }
                         0
                     } else {
                         -1
@@ -698,6 +813,14 @@ mod abi {
             }
         }
         -1
+    }
+    #[no_mangle]
+    pub extern "C" fn rb_set_song(len: usize) -> i32 {
+        set_song_from_input(len, false)
+    }
+    #[no_mangle]
+    pub extern "C" fn rb_set_song_controls(len: usize) -> i32 {
+        set_song_from_input(len, true)
     }
     #[no_mangle]
     pub extern "C" fn rb_command(command: u32, value: u32) {
@@ -877,6 +1000,50 @@ mod tests {
         assert!(out.iter().all(|x| x.is_finite()));
         out
     }
+    fn quiet_tempo_song() -> Song {
+        let mut song = Song::default();
+        song.bpm = 120.; song.enabled = [false; 4]; song.looping = false;
+        song.arrangement.resize(64, song.slots);
+        song.fx.delay_enabled = false; song.fx.filter_enabled = false;
+        song.fx.compressor_enabled = false; song.fx.distortion_enabled = false;
+        song
+    }
+    #[test]
+    fn live_tempo_changes_keep_the_transport_phase() {
+        for bpm in [119., 121.] {
+            let mut song = quiet_tempo_song();
+            let mut e = Engine::new(44100.);
+            e.set_song(song.clone()); e.command(1, 0);
+            render(&mut e, 30.);
+            assert_eq!(e.position(), 240);
+            song.bpm = bpm; e.set_song(song);
+            let mut block = [0.; 512]; e.render(&mut block);
+            assert_eq!(e.position(), 240, "tempo change jumped the playhead");
+            render(&mut e, 0.25);
+            assert_eq!(e.position(), 242, "tempo change stalled or accelerated the playhead");
+        }
+    }
+    #[test]
+    fn live_tempo_changes_keep_nonzero_loop_and_continue_in_phase() {
+        let mut song = quiet_tempo_song();
+        song.song_mode = true; song.looping = true; song.start = 3; song.length = 2;
+        let mut e = Engine::new(44100.);
+        e.set_song(song.clone()); e.command(2, 3); e.command(1, 0);
+        for bpm in [119., 180., 75., 121., 120.] {
+            song.bpm = bpm; e.set_song(song.clone());
+            for _ in 0..13 {
+                render(&mut e, 0.1);
+                let expected = (e.sequence_origin as f64 + e.sequence_pos) as u32 / 48;
+                assert_eq!(e.position(), expected, "loop phase at {bpm} BPM");
+                assert!((3..5).contains(&e.bar));
+            }
+            e.command(0, 0);
+            song.bpm = bpm + 1.; e.set_song(song.clone()); e.command(1, 0);
+            render(&mut e, 0.1);
+            let expected = (e.sequence_origin as f64 + e.sequence_pos) as u32 / 48;
+            assert_eq!(e.position(), expected, "continue phase at {bpm} BPM");
+        }
+    }
     #[test]
     fn pattern_always_loops() {
         let mut e = Engine::new(8000.);
@@ -927,7 +1094,7 @@ mod tests {
                     "{k}/{id}"
                 );
                 e.command(5, 0);
-                assert!(render(&mut e, 0.01).iter().all(|x| *x == 0.));
+                assert!(render(&mut e, 0.01).iter().all(|x| x.abs() < 1./32768.));
             }
         }
     }
@@ -1059,7 +1226,7 @@ mod tests {
         assert!(e.step >= snapshot.2);
     }
     #[test]
-    fn disabled_tied_acid_releases() {
+    fn disabled_tied_acid_releases_at_next_bar() {
         let mut s = Song::default();
         s.channels[1].mute = true;
         s.channels[2].mute = true;
@@ -1077,8 +1244,32 @@ mod tests {
         assert!(render(&mut e, 0.1).iter().any(|x| x.abs() > 1e-5));
         s.enabled[0] = false;
         e.set_song(s);
-        let out = render(&mut e, 0.4);
-        assert!(out[out.len() - 512..].iter().all(|x| x.abs() < 1e-6));
+        let before_bar = render(&mut e, 0.4);
+        assert!(before_bar.iter().any(|x|x.abs()>1e-5));
+        let out = render(&mut e, 2.);
+        assert!(out[out.len() - 512..].iter().all(|x| x.abs() < 1./32768.));
+    }
+    #[test]
+    fn pending_pattern_latches_at_bar_after_five_step_pattern() {
+        let mut song = Song::default(); song.song_mode=true; song.looping=false; song.bpm=120.;
+        song.patterns[0].lengths[0]=5;
+        song.arrangement=vec![[0,1,2,3],[1,1,2,3],[1,1,2,3]];song.length=3;
+        let mut e=Engine::new(44100.);e.set_song(song);e.command(2,0);e.command(1,0);
+        render(&mut e,2.01);
+        assert_eq!(e.active_slots[0],1);assert_eq!(e.pattern_start[0],768);
+    }
+    #[test]
+    fn device_rate_uses_the_same_reference_core() {
+        let mut song=Song::default(); song.fx.delay_enabled=false;
+        let mut a=Engine::new(44100.);a.set_song(song.clone());a.command(1,0);
+        let mut b=Engine::new(48000.);b.set_song(song);b.command(1,0);
+        let mut reference=vec![0.;4412*2];a.render(&mut reference);
+        let mut converted=vec![0.;4800*2];b.render(&mut converted);
+        for i in 0..4800 {
+            let pos=i as f64*44100./48000.;let j=pos as usize;let frac=(pos-j as f64) as f32;
+            for ch in 0..2 {let expected=reference[j*2+ch]+(reference[(j+1)*2+ch]-reference[j*2+ch])*frac;
+                assert!((converted[i*2+ch]-expected).abs()<1e-6);}
+        }
     }
     #[test]
     fn legacy_909_flams_follow_tempo_strength_and_new_step_cancellation() {
@@ -1114,7 +1305,7 @@ mod tests {
         e.command(1, 0);
         render(&mut e, 0.1);
         assert_eq!(e.flams[0][1].iter().filter(|t| **t > 0.).count(), 4);
-        render(&mut e, 0.11);
+        render(&mut e, 0.105);
         assert_eq!(e.flams[0][1].iter().filter(|t| **t > 0.).count(), 6);
     }
 
@@ -1211,4 +1402,112 @@ mod midi_sync_tests {
         assert_eq!(e.track_count[0], 5);
         assert_eq!(e.track_step[0], 2);
     }
+}
+
+#[cfg(test)]
+mod custom_sample_engine_tests {
+    use super::*;
+    #[test]
+    fn assigned_sample_reaches_song_render_for_both_kits() {
+        for kit in 0..2 {
+            let mut song = Song::default();
+            song.enabled = [false, false, kit == 0, kit == 1];
+            song.fx.delay_enabled = false;
+            song.fx.distortion_enabled = false;
+            song.fx.filter_enabled = false;
+            song.fx.compressor_enabled = false;
+            for slot in &mut song.patterns { for row in &mut slot.drums[kit] { row.fill(0); } }
+            let slot = song.slots[kit + 2];
+            song.patterns[slot].drums[kit][1][0] = 1;
+            song.samples[kit][1] = Some(std::sync::Arc::new(rb_model::samples::CustomSample { name: "silence".into(), sample_rate: 8000, pcm: vec![0; 1000] }));
+            let mut engine = Engine::new(8000.);
+            engine.set_song(song.clone()); engine.command(1, 0);
+            let mut silent = [0.; 512]; engine.render(&mut silent);
+            assert!(silent.iter().all(|v| v.abs() < 1./32768.));
+            song.samples[kit][1] = Some(std::sync::Arc::new(rb_model::samples::CustomSample { name: "tone".into(), sample_rate: 8000, pcm: vec![16384; 1000] }));
+            let mut engine = Engine::new(8000.);
+            engine.set_song(song); engine.command(1, 0);
+            let mut audible = [0.; 512]; engine.render(&mut audible);
+            assert!(audible.iter().any(|v| v.abs() > 0.001));
+        }
+    }
+    #[test]
+    fn delayed_flam_retriggers_custom_sample() {
+        for kit in 0..2 {
+            let mut song = Song::default();
+            song.fx.delay_enabled = false;
+            song.fx.distortion_enabled = false;
+            song.fx.filter_enabled = false;
+            song.fx.compressor_enabled = false;
+            song.samples[kit][1] = Some(std::sync::Arc::new(rb_model::samples::CustomSample {
+                name: "impulse".into(), sample_rate: 44100, pcm: vec![16384],
+            }));
+            let mut engine = Engine::new(44100.);
+            engine.set_song(song);
+            engine.prepare_export();
+            engine.command(3, (kit * 16 + 1) as u32);
+            engine.flams[kit][1][0] = 128.;
+            engine.flam_gain[kit][1][0] = 1.;
+            let mut output = [0.; 512];
+            engine.render(&mut output);
+            assert!(output[0].abs() > 0.001);
+            assert!((output[0]-output[127*2]).abs()<1e-6);
+            assert!(output.chunks_exact(2).enumerate().all(|(i, frame)| {
+                i == 0 || i == 127 || frame.iter().all(|v|v.abs()<1./32768.)
+            }));
+        }
+    }
+
+    #[test]
+    fn controls_only_update_preserves_samples_and_full_update_clears() {
+        let mut original = Song::default();
+        let sample = std::sync::Arc::new(rb_model::samples::CustomSample {
+            name: "one shot".into(), sample_rate: 8000, pcm: vec![16384],
+        });
+        original.samples[0][1] = Some(sample.clone());
+        let bank = std::sync::Arc::new(rb_model::samples::SampleBank { name:"bank".into(), samples: vec![None;46] });
+        original.loaded_bank = Some(bank.clone());
+        let mut engine = Engine::new(8000.);
+        engine.set_song(original);
+        let mut controls = Song::default();
+        controls.bpm = 140.;
+        engine.set_song_preserving_samples(controls.clone());
+        assert_eq!(engine.song.bpm, 140.);
+        assert!(std::sync::Arc::ptr_eq(engine.song.loaded_bank.as_ref().unwrap(), &bank));
+        assert!(std::sync::Arc::ptr_eq(engine.song.samples[0][1].as_ref().unwrap(), &sample));
+        assert!(std::sync::Arc::ptr_eq(engine.current.samples[0][1].as_ref().unwrap(), &sample));
+        engine.set_song(controls);
+        assert!(engine.song.samples[0][1].is_none());
+        assert!(engine.song.loaded_bank.is_none());
+        assert!(engine.current.samples[0][1].is_none());
+    }
+
+    #[test]
+    fn bank_sample_is_rendered_and_manual_sample_overrides() {
+        for kit in 0..2 {
+            let mut song = Song::default();
+            song.fx.delay_enabled = false;
+            song.fx.distortion_enabled = false;
+            song.fx.filter_enabled = false;
+            song.fx.compressor_enabled = false;
+            let mut bank = rb_model::samples::SampleBank { name:"bank".into(), samples:vec![None;46] };
+            let index = if kit == 0 {0} else {27};
+            bank.samples[index] = Some(std::sync::Arc::new(rb_model::samples::CustomSample {
+                name:"impulse".into(), sample_rate:44100, pcm:vec![16384],
+            }));
+            song.loaded_bank=Some(std::sync::Arc::new(bank));
+            let mut engine=Engine::new(44100.);
+            engine.set_song(song.clone()); engine.prepare_export(); engine.command(3,(kit*16+1) as u32);
+            let mut out=[0.;32]; engine.render(&mut out);
+            assert!(out.iter().any(|v| v.abs()>0.001));
+            song.samples[kit][1]=Some(std::sync::Arc::new(rb_model::samples::CustomSample {
+                name:"silence".into(), sample_rate:44100, pcm:vec![0;16],
+            }));
+            let mut engine=Engine::new(44100.);
+            engine.set_song(song); engine.prepare_export(); engine.command(3,(kit*16+1) as u32);
+            engine.render(&mut out);
+            assert!(out.iter().all(|v| v.abs()<1./32768.));
+        }
+    }
+
 }

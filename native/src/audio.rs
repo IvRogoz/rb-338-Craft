@@ -32,6 +32,16 @@ pub struct AudioBackend {
     thread: Option<JoinHandle<()>>,
 }
 impl AudioBackend {
+    #[cfg(test)]
+    pub(crate) fn offline() -> (Self, mpsc::Receiver<AudioMessage>) {
+        let engine = Engine::new(48000.0);
+        let snapshot = Arc::new(Mutex::new(Snapshot {
+            position: 0, tick: 0, playing: false, metrics: [0.; 11],
+            controls: engine.live_controls(), rendered_frames: 0, peak: 0., bpm: 127., error: None,
+        }));
+        let (tx, rx) = mpsc::channel();
+        (Self { tx, snapshot, thread: None }, rx)
+    }
     pub fn start(muted: bool) -> Result<Self, String> {
         let engine = Engine::new(48000.0);
         let snapshot = Arc::new(Mutex::new(Snapshot {
@@ -269,14 +279,14 @@ unsafe fn cleanup(handle: HWAVEOUT, buffers: Vec<Buffer>) -> Option<String> {
     error
 }
 fn pcm(v: f32) -> i16 {
-    (v.clamp(-1., 1.) * i16::MAX as f32) as i16
+    rb_engine::pcm_i16(v)
 }
 #[cfg(test)]
 mod tests {
     #[test]
     fn pcm_limits() {
         assert_eq!(super::pcm(2.), 32767);
-        assert_eq!(super::pcm(-2.), -32767);
+        assert_eq!(super::pcm(-2.), -32768);
         assert_eq!(super::pcm(0.), 0);
     }
 }

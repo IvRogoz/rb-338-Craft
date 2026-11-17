@@ -355,7 +355,7 @@ fn pattern(app: &mut NativeApp, ui: &mut egui::Ui, r: Rect, t: usize) {
         rect(r, 4., 96., 14., 15.),
         &format!("shuffle_track:{t}"),
         "",
-        song.shuffle_tracks[t],
+        song.shuffle_for(slot, t),
         5.,
     );
     skin::digits(

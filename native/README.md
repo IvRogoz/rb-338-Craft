@@ -16,7 +16,33 @@ The rack provides two bass synths, 808-style and 909-style drums, four pattern s
 
 **SONG / FILE · LIBRARY** at the top opens the native song modal for import, JSON saving, the named library, scenes and measure editing, pattern utilities, MIDI, and WAV export. Close it with **CLOSE** or Escape. Import accepts ReBirth `.rbs`, current JSON, and legacy JSON; saving produces JSON. WAV export renders the selected arrangement loop as 44.1 kHz stereo, 16-bit PCM, up to 256 MiB, without appended delay tails.
 
-Audio output uses WinMM at 48 kHz, stereo, 16-bit. Native Windows MIDI supports a selected input device and channel, controller/panel mappings, and external clock/transport sync. Named saves are in `%LOCALAPPDATA%\RB338Craft\Songs`.
+Audio output uses WinMM at 48 kHz, stereo, 16-bit. The DSP runs at 44.1 kHz in 64-frame blocks and converts that output to the device rate; offline WAV export uses the same core. Native Windows MIDI supports a selected input device and channel, controller/panel mappings, and external clock/transport sync. Named saves are in `%LOCALAPPDATA%\RB338Craft\Songs`.
+
+For custom samples, open **SONG / FILE · LIBRARY → CUSTOM SAMPLES**, choose
+808 or 909 and a voice, then **LOAD WAV…**. That sample replaces the selected
+voice across its patterns and is embedded in JSON saves and WAV exports.
+**CLEAR SAMPLE** removes the manual override; the bank or synthesized voice is used on its next trigger.
+Loading does not start playback. WAV input supports mono/stereo PCM
+8/16/24/32-bit and float32 at 8–192 kHz, including WAVEFORMATEXTENSIBLE
+PCM/float headers; stereo is mixed to mono and stored as
+16-bit PCM. The total sample budget is 2,000,000 frames per song (about
+45.4 seconds at 44.1 kHz), including samples loaded from a bank.
+
+RBS import automatically loads its named `.rbm` bank from a nearby `Mods`
+folder, `Mods` beside the executable, `%LOCALAPPDATA%\RB338Craft\Mods`, or
+`RB338_MOD_DIR`. The supplied [Trancer bank](Mods/README.md) lets
+`songs/rbs-examples/lightspe.rbs` load its custom instruments. Other missing
+banks produce an error rather than silently substituting synthesized sounds.
+Loaded bank audio is embedded in JSON saves, so saved songs remain portable.
+The Song/File dialog reports the loaded bank name and resource count.
+
+For file-only verification without a window or audio device:
+
+```powershell
+.\target\release\rb338-native.exe --render-song songs\rbs-examples\lightspe.rbs target\lightspe.wav
+```
+
+This also writes `target\lightspe.wav.json` with the loaded bank/resource count.
 
 ## Build from source
 

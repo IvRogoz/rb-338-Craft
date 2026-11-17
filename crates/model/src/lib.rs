@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod arrangement;
 pub mod rbs;
+pub mod samples;
 pub const DRUM_IDS: [&str; 12] = [
     "AC", "BD", "SD", "LT", "MT", "HT", "RS", "CP", "CB", "CY", "OH", "CH",
 ];
@@ -21,6 +22,8 @@ pub struct Pattern {
     pub notes: [Vec<Note>; 2],
     pub drums: [Vec<Vec<u8>>; 2],
     pub lengths: [usize; 4],
+    #[serde(default)]
+    pub shuffle_tracks: Option<[bool; 4]>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Synth {
@@ -100,6 +103,8 @@ pub struct ControlState {
 pub struct Song {
     pub version: u32,
     pub name: String,
+    #[serde(default)]
+    pub sample_bank: String,
     pub bpm: f32,
     pub shuffle: f32,
     #[serde(default = "all_true")]
@@ -117,6 +122,10 @@ pub struct Song {
     pub arrangement: Vec<[usize; 4]>,
     pub synth: [Synth; 2],
     pub drums: [DrumKit; 2],
+    #[serde(default, deserialize_with = "samples::deserialize_slots")]
+    pub samples: samples::SampleSlots,
+    #[serde(default)]
+    pub loaded_bank: Option<std::sync::Arc<samples::SampleBank>>,
     pub channels: [Channel; 4],
     pub fx: Effects,
     pub automation: Vec<Automation>,
@@ -179,12 +188,14 @@ impl Default for Song {
                     notes,
                     drums,
                     lengths: [16; 4],
+                    shuffle_tracks: None,
                 }
             })
             .collect();
         Self {
             version: 1,
             name: "Untitled".into(),
+            sample_bank: String::new(),
             bpm: 127.,
             shuffle: 0.,
             enabled: [true; 4],
@@ -202,6 +213,8 @@ impl Default for Song {
                 voices: vec![drum.clone(); 12],
                 flam: 0.03,
             }),
+            samples: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            loaded_bank: None,
             channels: std::array::from_fn(|_| channel.clone()),
             fx: Effects {
                 master: 0.75,
@@ -232,6 +245,17 @@ impl Default for Song {
     }
 }
 impl Song {
+    pub fn shuffle_for(&self, slot: usize, track: usize) -> bool {
+        self.patterns[slot].shuffle_tracks.map_or(self.shuffle_tracks[track], |flags| flags[track])
+    }
+    pub fn toggle_pattern_shuffle(&mut self, track: usize) {
+        let slot = self.slots[track];
+        if let Some(flags) = &mut self.patterns[slot].shuffle_tracks {
+            flags[track] = !flags[track];
+        } else {
+            self.shuffle_tracks[track] = !self.shuffle_tracks[track];
+        }
+    }
     pub fn control_state(&self) -> ControlState {
         ControlState {
             synth: self.synth.clone(),
@@ -307,6 +331,20 @@ impl Song {
                 || !finite(s.accent, 0., 1.)
             {
                 return fail();
+            }
+        }
+        let mut sample_frames = 0usize;
+        for sample in self.samples.iter().flatten().flatten() {
+            sample_frames = sample_frames.saturating_add(sample.pcm.len());
+            if sample_frames > samples::MAX_SAMPLE_FRAMES || sample.pcm.is_empty() || !(8000..=192000).contains(&sample.sample_rate) { return fail(); }
+        }
+        if self.samples.iter().any(|kit| kit[0].is_some()) { return fail(); }
+        if let Some(bank) = &self.loaded_bank {
+            if bank.samples.len() != 46 || bank.name.trim().is_empty()
+                || (!self.sample_bank.is_empty() && !self.sample_bank.eq_ignore_ascii_case(&bank.name)) { return fail(); }
+            for sample in bank.samples.iter().flatten() {
+                sample_frames = sample_frames.saturating_add(sample.pcm.len());
+                if sample_frames > samples::MAX_SAMPLE_FRAMES || sample.pcm.is_empty() || sample.sample_rate != 44100 { return fail(); }
             }
         }
         for k in &self.drums {
@@ -429,3 +467,47 @@ mod baseline_regression_tests {
     }
 }
 
+
+impl Song {
+    pub fn load_sample(&mut self, kit: usize, voice: usize, name: String, wav: &[u8]) -> Result<(), String> {
+        if kit >= 2 || !(1..12).contains(&voice) { return Err("Invalid drum voice".into()); }
+        let sample = samples::CustomSample::from_wav(name, wav)?;
+        let total: usize = self.samples.iter().flatten().flatten().map(|s| s.pcm.len()).sum::<usize>()
+            + self.loaded_bank.as_ref().map_or(0, |b| b.samples.iter().flatten().map(|s| s.pcm.len()).sum::<usize>());
+        let previous = self.samples[kit][voice].as_ref().map_or(0, |s| s.pcm.len());
+        if total - previous + sample.pcm.len() > samples::MAX_SAMPLE_FRAMES { return Err("Song sample frame limit exceeded".into()); }
+        let previous = self.samples[kit][voice].replace(std::sync::Arc::new(sample));
+        let result = serde_json::to_vec(self)
+            .map_err(|error| format!("Could not serialize song: {error}"))
+            .and_then(|json| if json.len() <= 16 * 1024 * 1024 {
+                Ok(())
+            } else {
+                Err("Song would exceed the 16 MiB song size limit".into())
+            });
+        if result.is_err() { self.samples[kit][voice] = previous; }
+        result
+    }
+    pub fn install_sample_bank(&mut self, bank: samples::SampleBank) -> Result<(), String> {
+        if bank.samples.len() != 46 { return Err("Sample bank must have 46 resource slots".into()); }
+        if bank.name.trim().is_empty() || (!self.sample_bank.is_empty() && !self.sample_bank.eq_ignore_ascii_case(&bank.name)) {
+            return Err("Sample bank name does not match the song's bank reference".into());
+        }
+        let mut total = self.samples.iter().flatten().flatten().map(|s| s.pcm.len()).sum::<usize>();
+        for sample in bank.samples.iter().flatten() {
+            if sample.sample_rate != 44100 || sample.pcm.is_empty() { return Err("Invalid bank sample".into()); }
+            total = total.checked_add(sample.pcm.len()).ok_or("Sample frame limit exceeded")?;
+            if total > samples::MAX_SAMPLE_FRAMES { return Err("Song sample frame limit exceeded".into()); }
+        }
+        let previous = self.loaded_bank.replace(std::sync::Arc::new(bank));
+        let result = serde_json::to_vec(self)
+            .map_err(|error| format!("Could not serialize song: {error}"))
+            .and_then(|json| if json.len() <= 16 * 1024 * 1024 { Ok(()) } else { Err("Song would exceed the 16 MiB song size limit".into()) });
+        if result.is_err() { self.loaded_bank = previous; }
+        result
+    }
+    pub fn clear_sample(&mut self, kit: usize, voice: usize) -> Result<(), String> {
+        if kit >= 2 || !(1..12).contains(&voice) { return Err("Invalid drum voice".into()); }
+        self.samples[kit][voice] = None;
+        Ok(())
+    }
+}

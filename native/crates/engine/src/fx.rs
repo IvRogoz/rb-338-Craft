@@ -1,282 +1,301 @@
+// Effects and table data derived from OpenRB-338, GPL-3.0, commit
+// cbca4492c0224dffaa477346bc8860559f3d853f.
 use rb_model::Song;
 
 #[path = "pcf.rs"]
 mod pcf;
 #[derive(Clone, Copy)]
 struct Compressor {
-    env: f32,
-    gain: f32,
-    attack: f32,
-    release: f32,
+    counter: u16, x: f32, off: f32, env: f32, gain: f32, floor: f32, hold: u16,
 }
 impl Compressor {
-    fn new(sr: f32) -> Self {
-        Self {
-            env: 0.,
-            gain: 1.,
-            attack: (-1. / (0.003 * sr)).exp(),
-            release: (-1. / (0.09 * sr)).exp(),
+    fn new() -> Self { Self { counter: 0, x: 1., off: 1., env: 1., gain: 0., floor: 1000., hold: 0 } }
+    fn process(&mut self, buses: &mut [&mut [f32; 64]], amount: f32, threshold: f32) {
+        if self.counter & 15 == 0 {
+            let a = byte(((amount - 1.) / 19.).clamp(0., 1.)) as f64 * f32::from_bits(0x3c010204) as f64;
+            let t = byte(10_f32.powf(threshold / 20.)) as f64;
+            self.off = (1. - a * 0.99) as f32;
+            self.x = (a * (t * 0.03125 + 1.) * 0.3662109375) as f32;
+            self.floor = ((t * f32::from_bits(0x3c010204) as f64) * 80000. / 32768. + 0.01220703125) as f32;
         }
-    }
-    fn gain(&mut self, peak: f32, threshold: f32, ratio: f32) -> f32 {
-        let k = if peak > self.env {
-            self.attack
-        } else {
-            self.release
-        };
-        self.env = peak + k * (self.env - peak);
-        // The reference Amount control blends automatic level gain, not a ratio-only limiter.
-        let amount = ((ratio - 1.) / 19.).clamp(0., 1.);
-        let threshold = 10_f32.powf(threshold / 20.).clamp(0., 1.);
-        let floor = 0.0122 + threshold * 2.44;
-        let level = 0.366 + threshold * 1.454;
-        let target = (1. - amount) + amount * level / self.env.max(floor);
-        let k = if target < self.gain {
-            self.attack
-        } else {
-            self.release
-        };
-        self.gain = target + k * (self.gain - target);
-        self.gain
+        self.counter = self.counter.wrapping_add(1);
+        let mut env = self.env as f64;
+        let mut gain = self.gain as f64;
+        for i in (0..64).step_by(4) {
+            let mut detector = buses[0][i+1] as f64 + buses[0][i+3] as f64;
+            for b in &buses[1..] { detector = detector + b[i+1] as f64 + b[i+3] as f64; }
+            detector = detector.abs();
+            if detector > env { self.hold = 300; env += (detector - env) * f32::from_bits(0x3c23d70a) as f64; }
+            else if self.hold == 0 { env = env * f32::from_bits(0x3f7f9724) as f64 + f32::from_bits(0x358637bd) as f64; }
+            else { self.hold -= 1; }
+            env = env.max(self.floor as f64);
+            let step = ((self.x as f64 / env + self.off as f64) - gain) * 0.25;
+            for k in 0..4 { gain += step; for b in buses.iter_mut() { b[i+k] = (b[i+k] as f64 * gain) as f32; } }
+        }
+        self.env = env as f32; self.gain = gain as f32;
     }
 }
-// Reference faders are logarithmic; retain the calibration point at knob 100.
-fn level_gain(value: f32) -> f32 {
-    if value <= 0. { 0. } else { ((value - 1.) * 5.406).exp() }
+// The level and pan curves use the original byte-indexed tables.
+fn byte(value: f32) -> usize { (value.clamp(0., 1.) * 127.).round() as usize }
+fn level_at(i: usize) -> f32 {
+    if i == 0 { return 0.; }
+    let mut v = 1_f32;
+    for _ in i..127 { v = (v as f64 - (1_f32 / 24.) as f64 * v as f64) as f32; }
+    v
 }
-fn mixer_gain(value: f32) -> f32 {
-    level_gain(value) * 2.485
-}
+fn level_gain(value: f32) -> f32 { level_at(byte(value)) }
+fn mixer_gain(value: f32) -> f32 { (2. * level_gain(value) as f64 + 0.000001_f32 as f64) as f32 }
 fn pan_gains(pan: f32) -> [f32; 2] {
-    let attenuation = if pan.abs() >= 0.999 { 0. } else { (-5.448 * pan * pan).exp() };
-    [if pan > 0. { attenuation } else { 1. }, if pan < 0. { attenuation } else { 1. }]
+    let p = ((pan.clamp(-1., 1.) * 63.5 + 63.5).round() as i32).clamp(0, 127);
+    let d = p - 64;
+    let cut = (127 - ((d * d) >> 5)).clamp(0, 127) as usize;
+    [if d > 0 { level_at(cut) } else { 1. }, if d < 0 { level_at(cut) } else { 1. }]
+}
+const GRID: [[f32; 5]; 5] = [
+    [1.2, 0.4, 0.28, 0.2, 0.15], [0.35, 0.2, 0.15, 0.14, 0.12],
+    [0.2, 0.15, 0.13, 0.12, 0.12], [0.15, 0.12, 0.11, 0.1, 0.1],
+    [0.12, 0.1, 0.08, 0.08, 0.08],
+];
+const SHAPER: &[u8; 32768] = include_bytes!("fx_tables.bin");
+fn shape(row: usize, v: f64) -> f64 {
+    let value = |i: usize| {
+        let at = (row * 256 + i) * 4;
+        f32::from_le_bytes(SHAPER[at..at + 4].try_into().unwrap()) as f64
+    };
+    if v < 0. { value(0) } else if v > 254. { value(254) } else {
+        let i = v as usize; (v - i as f64) * (value(i + 1) - value(i)) + value(i)
+    }
+}
+fn dist_grid(shape: usize, amount: usize) -> f64 {
+    let c = |x: usize| x as f64 * f32::from_bits(0x3c010204) as f64 * 3.999;
+    let (s, a) = (c(shape), c(amount));
+    let (i, j) = (s as usize, a as usize);
+    let (fs, fa) = (s - i as f64, a - j as f64);
+    let g = |r: usize, c: usize| GRID[r][c] as f64;
+    let top = (g(i+1,j+1)-g(i+1,j))*fa+g(i+1,j);
+    let bot = (g(i,j+1)-g(i,j))*fa+g(i,j);
+    fs*(top-bot)+bot
 }
 pub struct Rack {
-    sr: f32,
-    levels: [f32; 4],
-    sends: [f32; 4],
-    delay_pan: [f32; 2],
-    pans: [[f32; 2]; 4],
-    master: f32,
-    pcf: pcf::Pcf,
-    comp: [Compressor; 5],
-    prev: [f32; 4],
-    smooth: [f32; 4],
-    delay: Vec<f32>,
-    head: usize,
-    delay_target: f32,
-    delay_length: f32,
-    started: bool,
+    mixer_counter: u16, configured: bool, block_pending: bool, routing: [[bool; 3]; 4], master_comp: bool, levels: [f32; 4], sends: [f32; 4], pans: [[f32; 2]; 4], master: f32,
+    mix_gain: [[f32; 2]; 4], master_gain: f32, pcf: pcf::Pcf, comp: Compressor,
+    dist_counter: u16, dist_in: f32, dist_out: f32, dist_target_in: f32, dist_target_out: f32, dist_shape: usize,
+    delay: Vec<f32>, head: usize, delay_length: usize, delay_counter: u16,
+    delay_gain: [f32; 2], delay_target: [f32; 2], delay_feedback: f32, started: bool,
     pub metrics: [f32; 11],
 }
 impl Rack {
     pub fn new(sr: f32) -> Self {
-        Self {
-            sr,
-            levels: [0.; 4],
-            sends: [0.; 4],
-            delay_pan: [1.; 2],
-            pans: [[0.; 2]; 4],
-            master: 0.,
-            pcf: pcf::Pcf::new(sr),
-            comp: [Compressor::new(sr); 5],
-            prev: [0.; 4],
-            smooth: [0.; 4],
-            delay: vec![0.; (sr * 33.) as usize + 1],
-            head: 0,
-            delay_target: 1.,
-            delay_length: 1.,
-            started: false,
-            metrics: [0.; 11],
-        }
+        // The reference constructor updates its default mixer before song data is loaded.
+        let guard = f32::from_bits(0x358637bd);
+        let level = level_at(100);
+        let pan = (level as f64 + guard as f64) as f32;
+        let master = (2. * level as f64 + guard as f64) as f32;
+        Self { mixer_counter: 10, configured: true, block_pending: false, routing: [[false; 3]; 4], master_comp: false, levels: [level;4], sends: [guard;4], pans: [[pan;2];4], master, mix_gain: [[guard;2];4], master_gain: 1.,
+            pcf: pcf::Pcf::new(sr), comp: Compressor::new(), dist_counter: 0, dist_in: 0., dist_out: 0.,
+            dist_target_in: 0., dist_target_out: 0., dist_shape: 0,
+            delay: vec![0.; 131072], head: 0, delay_length: 0, delay_counter: 0,
+            delay_gain: [0.;2], delay_target: [0.;2], delay_feedback: 0., started: false, metrics: [0.;11] }
     }
     pub fn configure(&mut self, s: &Song) {
+        if !self.configured { self.update_mixer(s); self.configured = true; }
+    }
+    fn update_mixer(&mut self, s: &Song) {
         self.master = mixer_gain(s.fx.master);
-        self.delay_pan = pan_gains(s.fx.delay_pan);
+        self.master_comp = s.fx.compressor_master;
         for i in 0..4 {
-            self.levels[i] = mixer_gain(s.channels[i].level);
-            self.sends[i] = level_gain(s.channels[i].delay);
-            self.pans[i] = pan_gains(s.channels[i].pan);
-        }
-        self.delay_target = (self.sr * 60. / s.bpm / (if s.fx.delay_triplet { 3. } else { 4. })
-            * s.fx.delay_steps as f32)
-            .clamp(1., self.delay.len() as f32 - 2.);
-        if !self.started {
-            self.delay_length = self.delay_target;
+            let c = &s.channels[i];
+            self.routing[i] = [c.distortion, c.filter, c.compressor];
+            self.levels[i] = level_gain(if c.mute { 0. } else { c.level });
+
+            let p = ((c.pan.clamp(-1.,1.) * 63.5 + 63.5).round() as i32).clamp(0,127);
+            let d = p - 64; let level = byte(if c.mute { 0. } else { c.level }) as i32;
+            let cut = (level - ((d*d)>>5)).clamp(0,127) as usize;
+            self.pans[i] = [if d > 0 { level_at(cut) } else { level_at(level as usize) },
+                            if d < 0 { level_at(cut) } else { level_at(level as usize) }];
+            let send_level = if s.vintage { (self.pans[i][0] as f64 + self.pans[i][1] as f64) * 0.5 } else { self.levels[i] as f64 };
+            self.sends[i] = (send_level * level_gain(c.delay) as f64 + 0.000001_f32 as f64) as f32;
+            self.pans[i] = self.pans[i].map(|x| (x as f64 + 0.000001_f32 as f64) as f32);
         }
     }
     pub fn clear(&mut self, echo: bool) {
-        self.pcf.clear();
-        self.comp = [Compressor::new(self.sr); 5];
-        self.prev = [0.; 4];
-        self.smooth = [0.; 4];
-        self.metrics = [0.; 11];
-        if echo {
-            self.delay.fill(0.);
-            self.started = false;
-        }
+        self.block_pending = false;
+        self.pcf.clear(); self.comp = Compressor::new(); self.mix_gain = [[0.;2];4]; self.master_gain = 0.;
+        self.metrics = [0.;11];
+        if echo { self.delay.fill(f32::from_bits(0x358637bd)); self.started = false; }
     }
-    pub fn tick(&mut self, tick: usize, _s: &Song) {
-        self.pcf.tick(tick);
-    }
-    pub fn sample(&mut self, ch: [f32; 4], s: &Song, click: f32) -> [f32; 2] {
+    pub fn tick(&mut self, tick: usize, _s: &Song) { self.pcf.tick(tick); }
+    fn distort(&mut self, bus: &mut [f32;64], s: &Song) {
         let f = &s.fx;
-        if f.filter_enabled && s.channels.iter().any(|c| c.filter) {
-            self.pcf.advance(s);
-        }
-        let mut stereo = [0.; 2];
-        let mut send = 0.;
-        for i in 0..4 {
-            let c = &s.channels[i];
-            // Inserts precede the fader; convert the normalized voices to the insert's headroom.
-            let mut x = if c.mute { 0. } else { ch[i] * 2.18 };
-            if c.distortion && f.distortion_enabled && f.distortion > 0. {
-                self.metrics[9] = self.metrics[9].max(x.abs());
-                let drive = 1. + level_gain(f.distortion) * 16.;
-                let ceiling = 1. / (1. + level_gain(f.distortion.min(90. / 127.)) * 16.);
-                let before = self.prev[i];
-                self.prev[i] = x;
-                let mut sum = 0.;
-                for sub in 1..=4 {
-                    let z = (before + (x - before) * sub as f32 * 0.25) * drive;
-                    sum += z.clamp(-ceiling, ceiling) * (1. - f.distortion_shape)
-                        + (z / ceiling).tanh() * ceiling * f.distortion_shape;
+
+                if self.dist_counter & 15 == 0 {
+                    let amount = byte(f.distortion); self.dist_shape = byte(f.distortion_shape);
+                    self.dist_target_in = ((level_at(amount) as f64 + 0.0625) * 2048.) as f32;
+                    self.dist_target_out = (dist_grid(self.dist_shape, amount) * 5. / 256.) as f32;
                 }
-                self.smooth[i] += 0.8 * (sum * 0.25 - self.smooth[i]);
-                x = self.smooth[i];
-            }
-            // ReBirth's inserts are serial: distortion, PCF, compressor.
-            if c.filter && f.filter_enabled {
-                self.metrics[7] = self.metrics[7].max(x.abs());
-                x = self.pcf.sample(i, x, f.filter_mode == "BP");
-            }
-            if c.compressor && f.compressor_enabled && !f.compressor_master {
-                self.metrics[10] = self.metrics[10].max(x.abs());
-                x *= self.comp[i].gain(x.abs() * 2., f.compressor_threshold, f.compressor_ratio);
-                self.metrics[6] = self.metrics[6].max(-20. * self.comp[i].gain.max(1e-6).log10());
-            }
-            x *= self.levels[i] / 2.18;
-            self.metrics[i + 2] = self.metrics[i + 2].max(x.abs());
-            stereo[0] += x * self.pans[i][0] * std::f32::consts::FRAC_1_SQRT_2;
-            stereo[1] += x * self.pans[i][1] * std::f32::consts::FRAC_1_SQRT_2;
-            send += x * self.sends[i];
-        }
-        self.delay_length += (self.delay_target - self.delay_length) * 0.001;
-        self.metrics[8] = self.metrics[8].max(send.abs());
-        let read = (self.head as f32 + self.delay.len() as f32 - self.delay_length)
-            % self.delay.len() as f32;
-        let index = read as usize;
-        let part = read - index as f32;
-        let echo =
-            self.delay[index] * (1. - part) + self.delay[(index + 1) % self.delay.len()] * part;
-        self.delay[self.head] = (send + echo * f.delay_feedback).clamp(-8., 8.);
-        self.head = (self.head + 1) % self.delay.len();
-        self.started = true;
+                self.dist_counter = self.dist_counter.wrapping_add(1);
+                self.dist_in = (self.dist_in as f64 * 0.9 + self.dist_target_in as f64 * 0.1) as f32;
+                self.dist_out = (self.dist_out as f64 * 0.9 + self.dist_target_out as f64 * 0.1) as f32;
+                let amount = byte(f.distortion);
+                for x in bus.iter_mut() {
+                    self.metrics[9] = self.metrics[9].max(x.abs());
+                    *x = if self.dist_shape == 0 {
+                        let gain = 16. * level_at(amount) as f64 + 1.;
+                        let ceiling = 1. / (16. * level_at(amount.min(90)) as f64 + 1.);
+                        (gain * *x as f64).clamp(-ceiling, ceiling) as f32
+                    } else { (shape(self.dist_shape >> 2, self.dist_in as f64 * *x as f64 + 128.) * self.dist_out as f64) as f32 };
+                }
+                }
+    fn process_delay(&mut self, send: &[f32;64], output: &mut [[f32;2];64], s: &Song) {
+        let f = &s.fx;
         if f.delay_enabled {
-            stereo[0] += echo * f.delay_wet * self.delay_pan[0] * std::f32::consts::FRAC_1_SQRT_2;
-            stereo[1] += echo * f.delay_wet * self.delay_pan[1] * std::f32::consts::FRAC_1_SQRT_2;
-        }
-        if f.compressor_enabled && f.compressor_master {
-            self.metrics[10] = self.metrics[10].max(stereo[0].abs().max(stereo[1].abs()));
-            let gain = self.comp[4].gain(
-                (stereo[0].abs() + stereo[1].abs()) * 2.48,
-                f.compressor_threshold,
-                f.compressor_ratio,
-            );
-            for x in &mut stereo {
-                *x *= gain;
+            if self.delay_counter & 15 == 0 {
+                let tempo = (s.bpm * 1000.) as u32;
+                let divisor = if f.delay_triplet { 3 * tempo / 100 } else { 4 * tempo / 100 };
+                self.delay_length = (26_460_000u32.wrapping_mul(f.delay_steps as u32).checked_div(divisor).unwrap_or(0x1ffff).min(0x1ffff)) as usize;
+                self.delay_feedback = (byte(f.delay_feedback) as f64 / 127.) as f32;
+                self.delay_target = pan_gains(f.delay_pan).map(|x| (x as f64 + 0.000001) as f32);
             }
-            self.metrics[6] = (-20. * gain.max(1e-6).log10()).max(0.);
+            self.delay_counter = self.delay_counter.wrapping_add(1);
+            let mut gain = [0_f64;2];
+            for j in 0..2 { gain[j] = self.delay_gain[j] as f64 * 0.9 + self.delay_target[j] as f64 * 0.1; self.delay_gain[j] = gain[j] as f32; }
+            for n in 0..64 {
+                let idx = self.head.wrapping_sub(self.delay_length) & 131071;
+                let echo = self.delay[idx] as f64;
+                self.delay[self.head] = (send[n] as f64 + echo * self.delay_feedback as f64) as f32;
+                self.head = (self.head + 1) & 131071;
+                for j in 0..2 { output[n][j] = (output[n][j] as f64 + echo * gain[j] * f.delay_wet as f64) as f32; }
+                self.metrics[8] = self.metrics[8].max(send[n].abs());
+            }
+            self.started = true;
+        } else if self.started { self.delay.fill(f32::from_bits(0x358637bd)); self.started = false; }
+    }
+    pub fn begin_block(&mut self, s: &Song) {
+        if !self.block_pending {
+            if self.mixer_counter & 15 == 0 { self.update_mixer(s); }
+            self.mixer_counter = self.mixer_counter.wrapping_add(1);
+            self.block_pending = true;
         }
-        for j in 0..2 {
-            let x = (stereo[j] + click) * self.master;
-            assert!(x.is_finite(), "Non-finite audio state");
-            stereo[j] = x.clamp(-1., 1.);
-            self.metrics[j] = self.metrics[j].max(stereo[j].abs());
+    }
+    pub fn process_block(&mut self, input: &[[f32;4];64], s: &Song, clicks: &[f32;64]) -> [[f32;2];64] {
+        self.begin_block(s);
+        self.block_pending = false;
+        let f = &s.fx;
+        let guard = f32::from_bits(0x358637bd);
+        let mut output = [[guard;2];64]; let mut send = [guard;64];
+        for i in 0..4 {
+            let mut bus = [0_f32;64];
+            for n in 0..64 { bus[n] = input[n][i]; }
+            if self.routing[i][0] && f.distortion_enabled { self.distort(&mut bus, s); }
+            if self.routing[i][1] && f.filter_enabled { for x in &mut bus { self.metrics[7] = self.metrics[7].max(x.abs()); self.pcf.advance(s); *x = self.pcf.sample(i, *x, f.filter_mode == "BP"); } }
+            if self.routing[i][2] && f.compressor_enabled && !self.master_comp {
+                for x in &bus { self.metrics[10] = self.metrics[10].max(x.abs()); }
+                self.comp.process(&mut [&mut bus], f.compressor_ratio, f.compressor_threshold);
+                self.metrics[6] = (-20. * self.comp.gain.max(1e-6).log10()).max(0.);
+            }
+            let mut start = [0_f64;2]; let mut step = [0_f64;2];
+            for j in 0..2 {
+                start[j] = self.mix_gain[i][j] as f64;
+                let target = self.pans[i][j] as f64;
+                let new = start[j] * 0.93 + target * 0.07;
+                self.mix_gain[i][j] = new as f32; step[j] = (new - start[j]) / 32.;
+            }
+            let sg = self.sends[i] as f64;
+            for n in 0..64 {
+                let x = bus[n] as f64; send[n] = (send[n] as f64 + x * sg) as f32;
+                self.metrics[i+2] = self.metrics[i+2].max((x * self.levels[i] as f64).abs() as f32);
+                for j in 0..2 { output[n][j] = (output[n][j] as f64 + x * (start[j] + step[j] * (n / 2) as f64)) as f32; }
+            }
         }
-        stereo
+        self.process_delay(&send, &mut output, s);
+        if f.compressor_enabled && self.master_comp {
+            for x in &output { self.metrics[10] = self.metrics[10].max(x[0].abs().max(x[1].abs())); }
+            let mut left = output.map(|x| x[0]); let mut right = output.map(|x| x[1]);
+            self.comp.process(&mut [&mut left, &mut right], f.compressor_ratio, f.compressor_threshold);
+            for n in 0..64 { output[n] = [left[n],right[n]]; }
+            self.metrics[6] = (-20. * self.comp.gain.max(1e-6).log10()).max(0.);
+        }
+        let m = self.master_gain as f64 * 0.93 + self.master as f64 * 0.07;
+        self.master_gain = m as f32;
+        for n in 0..64 { for j in 0..2 {
+            output[n][j] = (((output[n][j] + clicks[n]) as f64 * m) as f32).clamp(-1., 1.);
+            self.metrics[j] = self.metrics[j].max(output[n][j].abs());
+        } }
+        output
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn delay_timing_and_pan() {
-        let mut s = Song::default();
-        s.bpm = 120.;
-        s.fx.delay_steps = 3;
-        s.fx.delay_triplet = true;
-        s.fx.compressor_enabled = false;
-        s.fx.delay_wet = 1.;
-        s.fx.delay_pan = 1.;
-        s.channels[0].delay = 1.;
-        let mut r = Rack::new(48000.);
-        r.configure(&s);
-        assert_eq!(r.delay_target, 24000.);
-        r.sample([1., 0., 0., 0.], &s, 0.);
-        for _ in 1..24000 {
-            assert_eq!(r.sample([0.; 4], &s, 0.), [0.; 2]);
-        }
-        let echo = r.sample([0.; 4], &s, 0.);
-        assert!(echo[1] > 0.35);
-        assert!(echo[0].abs() < 1e-6);
-    }
-    #[test]
-    fn logarithmic_faders_and_pan_keep_center_and_mute_endpoints() {
-        assert_eq!(mixer_gain(0.), 0.);
-        assert!((mixer_gain(100. / 127.) - 100. / 127.).abs() < 0.002);
-        assert!(mixer_gain(0.5) < 0.25);
-        assert_eq!(pan_gains(-1.), [1., 0.]);
-        assert_eq!(pan_gains(1.), [0., 1.]);
-        assert_eq!(pan_gains(0.), [1., 1.]);
-    }
-    #[test]
-    fn pcf_bypass_pauses_state_and_clear_resets_it() {
-        let mut song = Song::default();
-        song.fx.filter_enabled = false;
-        song.fx.delay_enabled = false;
-        song.fx.compressor_enabled = false;
-        song.channels[0].filter = true;
+    fn constructor_defers_song_compressor_until_first_mixer_update() {
+        let song = Song::default();
+        assert!(song.fx.compressor_enabled && song.fx.compressor_master);
         let mut rack = Rack::new(44100.);
         rack.configure(&song);
-        for _ in 0..64 { rack.sample([1., 0., 0., 0.], &song, 0.); }
-        song.fx.filter_enabled = true;
-        let first = rack.sample([1., 0., 0., 0.], &song, 0.);
-        rack.clear(true);
-        let reset = rack.sample([1., 0., 0., 0.], &song, 0.);
-        assert_eq!(first, reset);
+        let guard = f32::from_bits(0x358637bd);
+        let level = level_at(100);
+        assert_eq!(rack.levels, [level; 4]);
+        assert_eq!(rack.sends, [guard; 4]);
+        assert_eq!(rack.pans, [[(level as f64 + guard as f64) as f32; 2]; 4]);
+        assert_eq!(rack.master, (2. * level as f64 + guard as f64) as f32);
+        for _ in 0..6 {
+            rack.process_block(&[[0.; 4]; 64], &song, &[0.; 64]);
+            assert_eq!(rack.comp.counter, 0);
+        }
+        assert_eq!(rack.mixer_counter, 16);
+        rack.process_block(&[[0.; 4]; 64], &song, &[0.; 64]);
+        assert_eq!(rack.comp.counter, 1);
     }
     #[test]
-    fn pcf_amount_zero_retains_filter() {
-        let mut s = Song::default();
-        s.fx.filter_amount = 0.;
-        s.fx.filter_cutoff = 500.;
-        s.channels[0].filter = true;
-        s.channels[0].delay = 0.;
-        s.fx.compressor_enabled = false;
-        let mut r = Rack::new(48000.);
-        r.configure(&s);
-        let mut energy = 0.;
-        for i in 0..4800 {
-            let x = (2. * std::f32::consts::PI * 6000. * i as f32 / 48000.).sin();
-            let y = r.sample([x, 0., 0., 0.], &s, 0.);
-            energy += y[0] * y[0];
-        }
-        assert!(energy / 4800. < 0.001);
+    fn mixer_routing_latches_before_block_events() {
+        let mut song = Song::default();
+        song.channels[0].distortion = false;
+        song.fx.compressor_master = false;
+        let mut rack = Rack::new(44100.);
+        rack.configure(&song);
+        rack.mixer_counter = 16;
+        rack.begin_block(&song);
+        song.channels[0].distortion = true;
+        song.fx.compressor_master = true;
+        rack.begin_block(&song);
+        assert_eq!(rack.mixer_counter, 17);
+        assert!(!rack.routing[0][0]);
+        assert!(!rack.master_comp);
+        rack.process_block(&[[0.; 4]; 64], &song, &[0.; 64]);
+        for _ in 0..15 { rack.process_block(&[[0.; 4]; 64], &song, &[0.; 64]); }
+        rack.begin_block(&song);
+        assert!(rack.routing[0][0]);
+        assert!(rack.master_comp);
     }
     #[test]
-    fn compression_has_envelope() {
-        let mut c = Compressor::new(48000.);
-        let first = c.gain(1., -40., 20.);
-        for _ in 0..10000 {
-            c.gain(1., -40., 20.);
+    fn delay_matches_reference_impulse() {
+        let mut song = Song::default();
+        song.bpm = 120.; song.fx.delay_enabled = true; song.fx.delay_steps = 1;
+        song.fx.delay_triplet = false; song.fx.delay_feedback = 80. / 127.;
+        song.fx.delay_pan = 0.; song.fx.delay_wet = 1.;
+        let mut rack = Rack::new(44100.);
+        for block in 0..=86 {
+            let mut input = [0.; 64];
+            if block == 0 { input[0] = 0.25; }
+            let mut output = [[0.; 2]; 64];
+            rack.process_delay(&input, &mut output, &song);
+            if block == 86 { assert_eq!(output[8][0].to_bits(), 0x3e7ff937); }
         }
-        assert!(first > 0.9);
-        assert!(c.gain < 0.4);
-        let mut quiet = Compressor::new(48000.);
-        for _ in 0..10000 { quiet.gain(0.01, -40., 20.); }
-        assert!(quiet.gain > 5. && quiet.gain.is_finite());
-        for _ in 0..10000 { quiet.gain(0.01, -40., 1.); }
-        assert!((quiet.gain - 1.).abs() < 1e-4);
+    }
+    #[test]
+    fn distortion_and_compressor_match_reference_vectors() {
+        let mut song = Song::default();
+        song.fx.distortion = 70. / 127.;
+        song.fx.distortion_shape = 38. / 127.;
+        let mut rack = Rack::new(44100.);
+        let mut bus = [0.25; 64];
+        rack.distort(&mut bus, &song);
+        assert_eq!(bus[0].to_bits(), 0x3c58fd73);
+        let mut comp = Compressor::new();
+        let mut bus = [0.25; 64];
+        comp.process(&mut [&mut bus], 1. + 19. * 70. / 127., 20. * (64_f32 / 127.).log10());
+        assert_eq!(bus[0].to_bits(), 0x3d71121f);
+        assert_eq!(bus[63].to_bits(), 0x3e71121f);
     }
 }

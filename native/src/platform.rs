@@ -57,6 +57,10 @@ pub fn open_song_dialog() -> Result<Option<PathBuf>, String> {
     )
 }
 
+pub fn open_sample_dialog() -> Result<Option<PathBuf>, String> {
+    dialog(false, "", "WAV samples (*.wav)\0*.wav\0\0", "wav")
+}
+
 pub fn save_song_dialog(default_name: &str) -> Result<Option<PathBuf>, String> {
     dialog(
         true,
